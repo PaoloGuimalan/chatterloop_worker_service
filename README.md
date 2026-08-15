@@ -13,3 +13,4 @@ Project Creation
 Build (Debug)
 
 - run go build main.go
+- or go build ./cmd/worker/main.go

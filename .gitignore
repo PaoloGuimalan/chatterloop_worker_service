@@ -27,7 +27,7 @@ go.work.sum
 # Env files (contains sensitive API keys/passwords)
 .env
 .env.*
-! .env.example
+!.env.example
 
 # IDE specific files
 .idea/
