@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-
-	"github.com/joho/godotenv"
 )
 
 type Database interface {
@@ -19,7 +17,6 @@ var Active Database
 
 // Open builds the driver named by DB_DRIVER and connects it.
 func Open(ctx context.Context) (Database, error) {
-	godotenv.Load()
 	driver := os.Getenv("DB_DRIVER")
 	if driver == "" {
 		driver = "postgres"

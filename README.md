@@ -15,6 +15,11 @@ Build (Debug)
 - run go build main.go
 - or go build ./cmd/worker/main.go
 
+Run (Debug)
+
+- go run main.go
+- or go run ./cmd/worker/main.go
+
 Docker Build & Run
 
 - docker build -t worker-service .
