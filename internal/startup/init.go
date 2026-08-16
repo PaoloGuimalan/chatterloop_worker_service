@@ -37,7 +37,7 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 	slog.Info("Initializing RabbitMQ background consumers...")
 	// Every consumer dispatches through rabbitmq.Go rather than a bare `go`, so
 	// a panic in one handler is logged with its stack and confined to that
-	// message instead of taking the process — and with it all seven listeners —
+	// message instead of taking the process — and with it every other listener —
 	// down. Each callback declares its own `payload`, so closing over it is safe.
 	rmq.StartListener("update_ranking_score", func(body []byte) {
 		var payload rabbitmq.UpdateRankingPayload
@@ -120,12 +120,15 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			djangoLayout := "2006-01-02 15:04:05.000 -0700"
-
-			parsedTime, err := time.Parse(djangoLayout, payload.DatePosted)
-			if err != nil {
-				log.Printf("Failed to parse custom Django datetime string '%s': %v. Defaulting to time.Now()\n", payload.DatePosted, err)
-				parsedTime = time.Now()
+			// RFC3339, same as view_cache's created_at — one datetime format
+			// across the service. Publishers send datetime.isoformat().
+			parsedTime := time.Now()
+			if payload.DatePosted != "" {
+				if t, err := time.Parse(time.RFC3339, payload.DatePosted); err == nil {
+					parsedTime = t
+				} else {
+					log.Printf("Failed to parse date_posted '%s': %v. Defaulting to time.Now()\n", payload.DatePosted, err)
+				}
 			}
 
 			rabbitmq.CreatePostScoreForNewPost(ctx, payload.PostID, parsedTime)
@@ -144,6 +147,21 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			defer cancel()
 
 			rabbitmq.BulkFanoutToCache(ctx, payload.CurrentEntityID, payload.PostData, payload.Type)
+		})
+	})
+
+	rmq.StartListener("backfill_new_friend_feed", func(body []byte) {
+		var payload rabbitmq.BackfillFriendFeedPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal backfill friend feed payload: %v\n", err)
+			return
+		}
+
+		rabbitmq.Go("backfill_new_friend_feed", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			rabbitmq.BackfillNewFriendFeed(ctx, payload.ViewerID, payload.NewFriendID, payload.Type)
 		})
 	})
 }

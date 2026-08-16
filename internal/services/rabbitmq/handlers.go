@@ -50,6 +50,15 @@ type BulkFanoutPayload struct {
 }
 const DefaultFanoutType = "fanout"
 
+type BackfillFriendFeedPayload struct {
+	ViewerID    string `json:"viewer_id"`
+	NewFriendID string `json:"new_friend_id"`
+	Type        string `json:"type"`
+}
+
+// How many of the new friend's posts are considered for the backfill.
+const BackfillCandidateLimit = 50
+
 
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -666,4 +675,177 @@ func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData Pos
 
 	log.Printf("bulk_fanout_to_cache: Successfully fanned out Post ID %s for entity %s to %d follower feeds in Astra DB (type=%s).\n",
 		postData.ID, currentEntityID, len(followerIDs), rowType)
+}
+
+// mutualConnectionIDs mirrors ConnectionHelpers.get_mutual_connections: the
+// accepted connections both entities share. Each side must be an active +
+// verified account or an active realm (entity_side_is_visible).
+func mutualConnectionIDs(ctx context.Context, viewerID string, friendID string) []string {
+	const query = `
+		WITH visible AS (
+			SELECT c.action_by_id AS a, c.involved_entity_id AS b
+			FROM entity_connection c
+			LEFT JOIN user_account au ON au.entity_id = c.action_by_id
+			LEFT JOIN community_realm ar ON ar.entity_id = c.action_by_id
+			LEFT JOIN user_account bu ON bu.entity_id = c.involved_entity_id
+			LEFT JOIN community_realm br ON br.entity_id = c.involved_entity_id
+			WHERE c.status = TRUE
+			  AND c.action_by_id <> c.involved_entity_id
+			  AND (COALESCE(au.is_active AND au.is_verified, FALSE) OR COALESCE(ar.is_active, FALSE))
+			  AND (COALESCE(bu.is_active AND bu.is_verified, FALSE) OR COALESCE(br.is_active, FALSE))
+		),
+		viewer_peers AS (
+			SELECT DISTINCT CASE WHEN a = $1 THEN b ELSE a END AS peer
+			FROM visible WHERE a = $1 OR b = $1
+		),
+		friend_peers AS (
+			SELECT DISTINCT CASE WHEN a = $2 THEN b ELSE a END AS peer
+			FROM visible WHERE a = $2 OR b = $2
+		)
+		SELECT vp.peer
+		FROM viewer_peers vp
+		JOIN friend_peers fp ON fp.peer = vp.peer
+		WHERE vp.peer <> $1 AND vp.peer <> $2`
+
+	rows, err := connections.Pool().Query(ctx, query, viewerID, friendID)
+	if err != nil {
+		log.Printf("backfill_new_friend_feed: failed to resolve mutual connections for %s/%s: %v\n", viewerID, friendID, err)
+		return nil
+	}
+	defer rows.Close()
+
+	var peers []string
+	for rows.Next() {
+		var peer string
+		if err := rows.Scan(&peer); err == nil && peer != "" {
+			peers = append(peers, peer)
+		}
+	}
+	return peers
+}
+
+func engagedPostTimes(ctx context.Context, entityID string, activityTypes []string, candidates map[string]struct{}) map[string]time.Time {
+	out := make(map[string]time.Time)
+
+	userID, err := gocql.ParseUUID(entityID)
+	if err != nil {
+		return out
+	}
+
+	session := connections.CassandraSession()
+	if session == nil {
+		return out
+	}
+
+	const cql = `
+		SELECT target_id, activity_time
+		FROM user_engagement_log
+		WHERE user_id = ? AND activity_type IN ? AND target_type = 'post'
+		ALLOW FILTERING`
+
+	iter := session.Query(cql, userID, activityTypes).WithContext(ctx).Iter()
+
+	var targetID string
+	var activityTime time.Time
+	for iter.Scan(&targetID, &activityTime) {
+		if _, wanted := candidates[targetID]; !wanted {
+			continue
+		}
+		if prev, seen := out[targetID]; !seen || activityTime.After(prev) {
+			out[targetID] = activityTime
+		}
+	}
+
+	if err := iter.Close(); err != nil {
+		log.Printf("backfill_new_friend_feed: engagement scan failed for %s: %v\n", entityID, err)
+	}
+
+	return out
+}
+
+func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID string, rowType string) {
+	if rowType == "" {
+		rowType = DefaultFanoutType
+	}
+	if viewerID == "" || newFriendID == "" || viewerID == newFriendID {
+		return
+	}
+
+	const postQuery = `
+		SELECT post_id
+		FROM newsfeed_post
+		WHERE entity_id = $1
+		ORDER BY date_posted DESC
+		LIMIT $2`
+
+	postRows, err := connections.Pool().Query(ctx, postQuery, newFriendID, BackfillCandidateLimit)
+	if err != nil {
+		log.Printf("backfill_new_friend_feed: failed to load posts for %s: %v\n", newFriendID, err)
+		return
+	}
+	defer postRows.Close()
+
+	var candidateIDs []string
+	candidates := make(map[string]struct{})
+	for postRows.Next() {
+		var pid string
+		if err := postRows.Scan(&pid); err == nil && pid != "" {
+			candidateIDs = append(candidateIDs, pid)
+			candidates[pid] = struct{}{}
+		}
+	}
+
+	if len(candidateIDs) == 0 {
+		return
+	}
+
+	skip := make(map[string]time.Time)
+	merge := func(seen map[string]time.Time) {
+		for pid, ts := range seen {
+			if prev, ok := skip[pid]; !ok || ts.After(prev) {
+				skip[pid] = ts
+			}
+		}
+	}
+
+	for _, mutualID := range mutualConnectionIDs(ctx, viewerID, newFriendID) {
+		merge(engagedPostTimes(ctx, mutualID, []string{"comment", "share"}, candidates))
+	}
+	merge(engagedPostTimes(ctx, viewerID, []string{"view"}, candidates))
+
+	session := connections.CassandraSession()
+	if session == nil {
+		log.Println("Astra DB disconnected. Skipping friend feed backfill.")
+		return
+	}
+
+	batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
+
+	const insertCQL = `
+		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type)
+		VALUES (?, ?, ?, ?, ?)`
+
+	nowTimestamp := time.Now()
+	inserted := 0
+
+	for _, pid := range candidateIDs {
+		if _, alreadyEngaged := skip[pid]; alreadyEngaged {
+			continue
+		}
+		batch.Query(insertCQL, viewerID, pid, nowTimestamp, newFriendID, rowType)
+		inserted++
+	}
+
+	if inserted == 0 {
+		log.Printf("backfill_new_friend_feed: nothing new to seed for viewer %s from %s.\n", viewerID, newFriendID)
+		return
+	}
+
+	if err := session.ExecuteBatch(batch); err != nil {
+		log.Printf("backfill_new_friend_feed: batch insert failed for viewer %s: %v\n", viewerID, err)
+		return
+	}
+
+	log.Printf("backfill_new_friend_feed: Seeded %d of %d posts by %s into %s's timeline (type=%s).\n",
+		inserted, len(candidateIDs), newFriendID, viewerID, rowType)
 }
