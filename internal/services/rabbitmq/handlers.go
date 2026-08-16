@@ -9,6 +9,7 @@ import (
 	"worker_service/internal/connections"
 	"worker_service/internal/models"
 
+	"github.com/gocql/gocql"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -16,6 +17,13 @@ type UpdateRankingPayload struct {
     PostID     string `json:"post_id"`
     UpdateType string `json:"update_type"`
     IsDecrease bool	`json:"is_decrease"`
+}
+
+type BumpInterestAffinityPayload struct {
+	EntityID   string   `json:"entity_id"`
+	InterestIDs []string `json:"interest_ids"`
+	Action     string   `json:"action"`
+	IsDecrease bool     `json:"is_decrease"`
 }
 
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
@@ -161,4 +169,214 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	}
 
 	log.Printf("Successfully updated tracking score profile for Post ID: %s. Score: %f\n", post_id, rankingScore)
+}
+
+type ViewCachePayload struct {
+	EntityID  string                 `json:"entity_id"`
+	ViewCache []models.ViewCacheItem `json:"view_cache"`
+}
+
+func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem) []models.UserEngagementLog {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if len(viewCache) == 0 {
+		return []models.UserEngagementLog{}
+	}
+
+	userID, err := gocql.ParseUUID(entityID)
+	if err != nil {
+		log.Printf("Invalid entity UUID string for Cassandra: %v\n", err)
+		return []models.UserEngagementLog{}
+	}
+
+	viewedPostIDs := make([]string, 0, len(viewCache))
+	for _, view := range viewCache {
+		viewedPostIDs = append(viewedPostIDs, view.PostID)
+	}
+
+	interestsByPostID := make(map[string][]string)
+	
+	pgQuery := `
+		SELECT pil.post_id, pil.interest_id 
+		FROM interests_postinterestlink pil 
+		WHERE pil.post_id = ANY($1)`
+
+	pgRows, err := connections.Pool().Query(ctx, pgQuery, viewedPostIDs)
+	if err != nil {
+		log.Printf("Postgres join pre-fetch query error: %v\n", err)
+		return []models.UserEngagementLog{}
+	}
+	defer pgRows.Close()
+
+	for pgRows.Next() {
+		var pid, interestID string
+		if err := pgRows.Scan(&pid, &interestID); err == nil {
+			interestsByPostID[pid] = append(interestsByPostID[pid], interestID)
+			log.Println(interestsByPostID[pid], interestID)
+		}
+	}
+
+	var logsToCreate []models.UserEngagementLog
+	var postIDsToClean []string
+
+	var allInterestIDs []string
+
+	for _, view := range viewCache {
+		pid := view.PostID
+		poid := view.PostOwnerID
+		currentDuration := view.Duration
+
+		postIDsToClean = append(postIDsToClean, pid)
+
+		if interests, exists := interestsByPostID[pid]; exists {
+			allInterestIDs = append(allInterestIDs, interests...)
+		}
+
+		if poid != entityID {
+			createdAtTime, err := time.Parse(time.RFC3339, view.CreatedAt)
+			if err != nil {
+				createdAtTime = time.Now()
+			}
+
+			logUUID, err := gocql.RandomUUID()
+			if err != nil {
+				log.Printf("Failed to generate a cryptographic random UUID: %v\n", err)
+				continue // Skip this log entry if UUID generation fails
+			}
+
+			logInstance := models.UserEngagementLog{
+				LogID:        logUUID,
+				UserID:       userID,
+				ActivityTime: createdAtTime,
+				TimeSpent:    currentDuration,
+				ActivityType: "view",
+				TargetType:   "post",
+				TargetID:     pid,
+				CreatedAt:    time.Now(),
+				UpdatedAt:    time.Now(),
+			}
+			logsToCreate = append(logsToCreate, logInstance)
+		}
+	}
+
+	if len(allInterestIDs) > 0 {
+		go func(id string, interests []string) {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			
+			BumpInterestAffinity(bgCtx, id, interests, "VIEW", false)
+		}(entityID, allInterestIDs)
+	}
+
+	session := connections.CassandraSession()
+	if session == nil {
+		log.Println("Skipping metrics storage: Astra session disconnected")
+		return []models.UserEngagementLog{}
+	}
+
+	batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
+
+	insertCQL := `
+		INSERT INTO user_engagement_log (
+			log_id, user_id, activity_time, time_spent, activity_type, 
+			target_type, target_id, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	for _, logLog := range logsToCreate {
+		batch.Query(insertCQL, 
+			logLog.LogID.String(), logLog.UserID.String(), logLog.ActivityTime, float32(logLog.TimeSpent), 
+			logLog.ActivityType, logLog.TargetType, logLog.TargetID, logLog.CreatedAt, logLog.UpdatedAt,
+		)
+	}
+
+	deleteCQL := "DELETE FROM newsfeed_index WHERE bucket = ? AND post_id = ?"
+	for _, pidToClean := range postIDsToClean {
+		batch.Query(deleteCQL, entityID, pidToClean)
+	}
+
+	if err := session.ExecuteBatch(batch); err != nil {
+		log.Printf("Error saving viewcache metrics to Astra DB Batch: %v\n", err)
+		return []models.UserEngagementLog{}
+	}
+
+	log.Printf("Engagement Recorded")
+
+	return logsToCreate
+}
+
+func BumpInterestAffinity(ctx context.Context, entityID string, interestIDs []string, action string, isDecrease bool) {
+	var interactionWeights = map[string]float64{
+		"NEW_CONNECTION": 10.0,
+		"SHARE": 7.0,
+		"REPOST": 7.0,
+		"DIARY_TAG": 5.0,
+		"COMMENT": 4.0,
+		"LIKE": 1.0,
+		"VIEW": 0.1,
+		"PROFILE_VISIT": 0.5,
+	}
+
+	weight, exists := interactionWeights[action]
+	if !exists || weight == 0.0 {
+		return
+	}
+
+	if len(interestIDs) == 0 {
+		return
+	}
+
+	uniqueInterests := make(map[string]struct{})
+	for _, id := range interestIDs {
+		if id != "" {
+			uniqueInterests[id] = struct{}{}
+		}
+	}
+
+	delta := weight
+	if isDecrease {
+		delta = -weight
+	}
+
+	tx, err := connections.Pool().Begin(ctx)
+	if err != nil {
+		log.Printf("Failed to open affinity tracking transaction block: %v\n", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	affinityUpsert := `
+		INSERT INTO interests_entityinterestaffinity (entity_id, interest_id, score, last_bumped_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (entity_id, interest_id) DO UPDATE SET
+			score = interests_entityinterestaffinity.score + EXCLUDED.score,
+			last_bumped_at = NOW();`
+
+	trendingUpsert := `
+		INSERT INTO interests_interesttrendingscore (interest_id, score, recent_activity_boost, updated_at)
+		VALUES ($1, $2, 1.0, NOW())
+		ON CONFLICT (interest_id) DO UPDATE SET
+			score = interests_interesttrendingscore.score + EXCLUDED.score,
+			updated_at = NOW();`
+
+	for interestID := range uniqueInterests {
+		_, err = tx.Exec(ctx, affinityUpsert, entityID, interestID, delta)
+		if err != nil {
+			log.Printf("Failed atomic tracking execution on entity %s affinity: %v\n", entityID, err)
+			return
+		}
+
+		_, err = tx.Exec(ctx, trendingUpsert, interestID, delta)
+		if err != nil {
+			log.Printf("Failed atomic trending execution on interest %s metrics: %v\n", interestID, err)
+			return
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("Failed to commit affinity transactional modifications: %v\n", err)
+		return
+	}
+
+	log.Printf("Bump Affinity Recorded")
 }

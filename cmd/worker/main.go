@@ -34,7 +34,7 @@ func main(){
 	log.Println(art)
 
 	startup.Init()
-	defer connections.Active.Close()
+	defer connections.CloseAll()
 	defer rabbitmq.ActiveRabbitMQ.Close()
 	
 	mux := http.NewServeMux()

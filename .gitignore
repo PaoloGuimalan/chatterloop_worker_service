@@ -37,3 +37,6 @@ go.work.sum
 *.njsproj
 *.sln
 *.sw?
+
+# Cassandra 
+secure-connect-chatterloop.zip

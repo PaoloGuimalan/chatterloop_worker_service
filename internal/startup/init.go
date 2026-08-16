@@ -3,10 +3,11 @@ package startup
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"log/slog"
+	"time"
 	"worker_service/internal/connections"
+	"worker_service/internal/models"
 	"worker_service/internal/services/rabbitmq"
 )
 
@@ -15,8 +16,14 @@ func Init(){
 }
 
 func initialize_connections(){
-	if _, err := connections.Open(context.Background()); err != nil {
-		log.Fatal(err)
+	pgClient := &connections.Postgres{}
+	if err := connections.Open(context.Background(), "postgres", pgClient); err != nil {
+		log.Fatalf("Critical database initialization failed: %v", err)
+	}
+
+	cassClient := &connections.Cassandra{}
+	if err := connections.Open(context.Background(), "cassandra", cassClient); err != nil {
+		log.Fatalf("Critical database initialization failed: %v", err)
 	}
 
 	rmq, err := rabbitmq.RabbitClient()
@@ -44,6 +51,31 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 	})
 
 	rmq.StartListener("save_viewcache_engagements", func(body []byte) {
-		go fmt.Println(string(body))
+		var payload rabbitmq.ViewCachePayload
+
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal view cache JSON payload: %v\n", err)
+			return
+		}
+
+		go func(entity string, cache []models.ViewCacheItem) {
+			rabbitmq.SaveViewCacheEngagements(entity, cache)
+		}(payload.EntityID, payload.ViewCache)
+	})
+
+	rmq.StartListener("bump_interest_affinity", func(body []byte) {
+		var payload rabbitmq.BumpInterestAffinityPayload
+
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal bump interest affinity payload: %v\n", err)
+			return
+		}
+
+		go func(entity string, interests []string, action string, decrease bool) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			rabbitmq.BumpInterestAffinity(ctx, entity, interests, action, decrease)
+		}(payload.EntityID, payload.InterestIDs, payload.Action, payload.IsDecrease)
 	})
 }

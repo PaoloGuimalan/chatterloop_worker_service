@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 )
 
 type Database interface {
@@ -14,34 +13,37 @@ type Database interface {
 }
 
 var Active Database
+var ActiveCassandra Database
 
-// Open builds the driver named by DB_DRIVER and connects it.
-func Open(ctx context.Context) (Database, error) {
-	driver := os.Getenv("DB_DRIVER")
-	if driver == "" {
-		driver = "postgres"
-	}
+var registry = make(map[string]Database)
 
-	var db Database
-	switch driver {
-	case "postgres":
-		db = &Postgres{}
-	// case "mysql":
-	//     db = &MySQL{}
-	default:
-		return nil, fmt.Errorf("unknown DB_DRIVER %q", driver)
-	}
-
+func Open(ctx context.Context, name string, db Database) error {
 	if err := db.Connect(ctx); err != nil {
-		return nil, fmt.Errorf("%s: %w", driver, err)
+		return fmt.Errorf("failed to connect %s: %w", name, err)
 	}
 
-		if err := db.Connect(ctx); err != nil {
-		return nil, fmt.Errorf("%s: %w", driver, err)
+	if err := db.Ping(ctx); err != nil {
+		db.Close()
+		return fmt.Errorf("failed to ping %s: %w", name, err)
 	}
 
-	log.Printf("Database (%v) connected", driver)
+	log.Printf("Database backend (%s) successfully connected and verified", name)
 
-	Active = db
-	return db, nil
+	registry[name] = db
+
+	switch name {
+		case "postgres":
+			Active = db
+		case "cassandra":
+			ActiveCassandra = db
+	}
+
+	return nil
+}
+
+func CloseAll() {
+	for name, db := range registry {
+		log.Printf("Closing database connection: %s", name)
+		db.Close()
+	}
 }
