@@ -38,6 +38,16 @@ type NewPostCreatedPayload struct {
 	DatePosted string `json:"date_posted"`
 }
 
+type PostData struct {
+	ID       string `json:"id"`
+	AuthorID string `json:"author_id"`
+}
+
+type BulkFanoutPayload struct {
+	PostData        PostData `json:"post_data"`
+	CurrentEntityID string   `json:"current_entity_id"`
+}
+
 
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -578,4 +588,65 @@ func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted ti
 	}
 
 	log.Printf("create_post_score_for_new_post: Successfully generated initial score profile for new Post ID: %s. Score: %f\n", postID, rankingScore)
+}
+
+func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData PostData) {
+	pgQuery := `
+		SELECT follower_id 
+		FROM entity_follow 
+		WHERE followee_id = $1 AND status = true 
+		ORDER BY interaction_score DESC, last_interaction_at DESC 
+		LIMIT 500`
+
+	pgRows, err := connections.Pool().Query(ctx, pgQuery, currentEntityID)
+	if err != nil {
+		log.Printf("Failed to resolve follower graph for Entity %s: %v\n", currentEntityID, err)
+		return
+	}
+	defer pgRows.Close()
+
+	var followerIDs []string
+	for pgRows.Next() {
+		var fidStr string
+		if err := pgRows.Scan(&fidStr); err == nil {
+			if fidStr != "" {
+				followerIDs = append(followerIDs, fidStr)
+			}
+		}
+	}
+
+	if len(followerIDs) == 0 {
+		return 
+	}
+
+	session := connections.CassandraSession()
+	if session == nil {
+		log.Println("Astra DB disconnected. Skipping timeline cache fanout.")
+		return
+	}
+
+	batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
+
+	insertCQL := `
+		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id) 
+		VALUES (?, ?, ?, ?)`
+
+	nowTimestamp := time.Now()
+
+	for _, followerID := range followerIDs {
+		batch.Query(insertCQL, 
+			followerID,
+			postData.ID,
+			nowTimestamp, 
+			postData.AuthorID,
+		)
+	}
+
+	if err := session.ExecuteBatch(batch); err != nil {
+		log.Printf("Error processing serverless Astra timeline fanout batch query: %v\n", err)
+		return
+	}
+
+	log.Printf("bulk_fanout_to_cache: Successfully fanned out Post ID %s for entity %s to %d follower feeds in Astra DB.\n", 
+		postData.ID, currentEntityID, len(followerIDs))
 }

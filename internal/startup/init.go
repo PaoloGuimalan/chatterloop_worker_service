@@ -129,4 +129,19 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			rabbitmq.CreatePostScoreForNewPost(ctx, p.PostID, parsedTime)
 		}(payload)
 	})
+
+	rmq.StartListener("bulk_fanout_to_cache", func(body []byte) {
+		var payload rabbitmq.BulkFanoutPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal bulk fanout payload: %v\n", err)
+			return
+		}
+
+		go func(p rabbitmq.BulkFanoutPayload) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			
+			rabbitmq.BulkFanoutToCache(ctx, p.CurrentEntityID, p.PostData)
+		}(payload)
+	})
 }
