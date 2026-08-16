@@ -78,4 +78,32 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			rabbitmq.BumpInterestAffinity(ctx, entity, interests, action, decrease)
 		}(payload.EntityID, payload.InterestIDs, payload.Action, payload.IsDecrease)
 	})
+
+	rmq.StartListener("interaction_score_bump", func(body []byte) {
+		var payload rabbitmq.InteractionBumpPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal connection interaction payload: %v\n", err)
+			return
+		}
+
+		go func(p rabbitmq.InteractionBumpPayload) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			rabbitmq.InteractionScoreBump(ctx, p.ActorID, p.ReceiverID, p.Action, p.IsDecrease)
+		}(payload)
+	})
+
+	rmq.StartListener("follower_interaction_score_bump", func(body []byte) {
+		var payload rabbitmq.InteractionBumpPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal follower interaction payload: %v\n", err)
+			return
+		}
+
+		go func(p rabbitmq.InteractionBumpPayload) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			rabbitmq.FollowerInteractionScoreBump(ctx, p.ActorID, p.ReceiverID, p.Action, p.IsDecrease)
+		}(payload)
+	})
 }

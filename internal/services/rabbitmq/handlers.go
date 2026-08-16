@@ -26,6 +26,14 @@ type BumpInterestAffinityPayload struct {
 	IsDecrease bool     `json:"is_decrease"`
 }
 
+type InteractionBumpPayload struct {
+	ActorID    string `json:"actor_id"`
+	ReceiverID string `json:"receiver_id"`
+	Action     string `json:"action"`
+	IsDecrease bool   `json:"is_decrease"`
+}
+
+
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -168,7 +176,7 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 		log.Fatalf("Failed to execute upsert on post score: %v", err)
 	}
 
-	log.Printf("Successfully updated tracking score profile for Post ID: %s. Score: %f\n", post_id, rankingScore)
+	log.Printf("update_ranking_score: Successfully updated tracking score profile for Post ID: %s. Score: %f\n", post_id, rankingScore)
 }
 
 type ViewCachePayload struct {
@@ -300,12 +308,15 @@ func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem)
 		return []models.UserEngagementLog{}
 	}
 
-	log.Printf("Engagement Recorded")
+	log.Printf("save_view_cache_engagements: Engagement Recorded")
 
 	return logsToCreate
 }
 
 func BumpInterestAffinity(ctx context.Context, entityID string, interestIDs []string, action string, isDecrease bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
 	var interactionWeights = map[string]float64{
 		"NEW_CONNECTION": 10.0,
 		"SHARE": 7.0,
@@ -378,5 +389,104 @@ func BumpInterestAffinity(ctx context.Context, entityID string, interestIDs []st
 		return
 	}
 
-	log.Printf("Bump Affinity Recorded")
+	log.Printf("bump_interest_affinity: Bump Affinity Recorded")
+}
+
+var interactionWeights = map[string]float64{
+	"NEW_CONNECTION": 10.0,
+	"SHARE":          7.0,
+	"REPOST":         7.0,
+	"COMMENT":        4.0,
+	"LIKE":           1.0,
+	"VIEW":           0.1,
+	"PROFILE_VISIT":  0.5,
+}
+
+func InteractionScoreBump(ctx context.Context, actorID string, receiverID string, action string, isDecrease bool) {
+	if actorID == receiverID {
+		return
+	}
+
+	weight, exists := interactionWeights[action]
+	if !exists || weight == 0.0 {
+		return
+	}
+
+	delta := weight
+	if isDecrease {
+		delta = -weight
+	}
+
+	tx, err := connections.Pool().Begin(ctx)
+	if err != nil {
+		log.Printf("Failed to begin transaction for interaction score bump: %v\n", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	optimizedQuery := `
+		UPDATE entity_connection
+		SET 
+			interaction_score = interaction_score + $1,
+			last_interaction_at = NOW()
+		WHERE connection_id IN (
+			SELECT connection_id 
+			FROM entity_connection
+			WHERE (action_by_id = $2 AND involved_entity_id = $3)
+			   OR (action_by_id = $3 AND involved_entity_id = $2)
+		)`
+
+	_, err = tx.Exec(ctx, optimizedQuery, delta, actorID, receiverID)
+	if err != nil {
+		log.Printf("Failed to execute optimized entity interaction bump: %v\n", err)
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("Failed to commit interaction score changes: %v\n", err)
+	}
+
+	log.Printf("interaction_score_bump: Interaction Bump Recorded")
+}
+
+func FollowerInteractionScoreBump(ctx context.Context, actorID string, receiverID string, action string, isDecrease bool) {
+	if receiverID == "" {
+		return
+	}
+
+	weight, exists := interactionWeights[action]
+	if !exists || weight == 0.0 {
+		return
+	}
+
+	delta := weight
+	if isDecrease {
+		delta = -weight
+	}
+
+	tx, err := connections.Pool().Begin(ctx)
+	if err != nil {
+		log.Printf("Failed to begin transaction for follower score bump: %v\n", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	followQuery := `
+		UPDATE entity_follow
+		SET 
+			interaction_score = interaction_score + $1,
+			last_interaction_at = NOW()
+		WHERE follower_id = $2 AND followee_id = $3`
+
+	_, err = tx.Exec(ctx, followQuery, delta, actorID, receiverID)
+	if err != nil {
+		log.Printf("Failed to execute follow score update parameters: %v\n", err)
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("Failed to commit follower interaction score changes: %v\n", err)
+	}
+
+	log.Printf("follower_interaction_score_bump: Follower Interaction Bump Recorded")
 }
