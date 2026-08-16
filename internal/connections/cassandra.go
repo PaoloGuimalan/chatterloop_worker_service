@@ -15,9 +15,6 @@ type Cassandra struct {
 	Session *gocql.Session
 }
 
-// requiredEnv reports the names of any variables that are absent or set to an
-// empty string, distinguishing the two — a missing line and `KEY=` have
-// different causes. Names only; values are never logged.
 func requiredEnv(names ...string) []string {
 	var problems []string
 	for _, name := range names {
@@ -32,10 +29,9 @@ func requiredEnv(names ...string) []string {
 	return problems
 }
 
-const defaultBundlePath = "secure-connect-chatterloop.zip"
-
 func (c *Cassandra) Connect(ctx context.Context) error {
 	if missing := requiredEnv(
+		"CASSANDRA_DB_BUNDLE",
 		"CASSANDRA_DB_TOKEN",
 		"CASSANDRA_DB_KEYSPACE",
 	); len(missing) > 0 {
@@ -43,15 +39,6 @@ func (c *Cassandra) Connect(ctx context.Context) error {
 	}
 
 	bundlePath := os.Getenv("CASSANDRA_DB_BUNDLE")
-	if bundlePath == "" {
-		bundlePath = defaultBundlePath
-	}
-
-	if _, err := os.Stat(bundlePath); err != nil {
-		cwd, _ := os.Getwd()
-		return fmt.Errorf("astra bundle not readable at %q (working dir %q): %w", bundlePath, cwd, err)
-	}
-
 	token := os.Getenv("CASSANDRA_DB_TOKEN")
 	keyspace := os.Getenv("CASSANDRA_DB_KEYSPACE")
 
