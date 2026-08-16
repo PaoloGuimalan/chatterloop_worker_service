@@ -32,12 +32,10 @@ func requiredEnv(names ...string) []string {
 	return problems
 }
 
+const defaultBundlePath = "secure-connect-chatterloop.zip"
+
 func (c *Cassandra) Connect(ctx context.Context) error {
-	// Named individually because this image is distroless: there is no shell to
-	// exec into and inspect the environment with, so this log line is the only
-	// diagnostic available in a deployed container.
 	if missing := requiredEnv(
-		"CASSANDRA_DB_BUNDLE",
 		"CASSANDRA_DB_TOKEN",
 		"CASSANDRA_DB_KEYSPACE",
 	); len(missing) > 0 {
@@ -45,6 +43,15 @@ func (c *Cassandra) Connect(ctx context.Context) error {
 	}
 
 	bundlePath := os.Getenv("CASSANDRA_DB_BUNDLE")
+	if bundlePath == "" {
+		bundlePath = defaultBundlePath
+	}
+
+	if _, err := os.Stat(bundlePath); err != nil {
+		cwd, _ := os.Getwd()
+		return fmt.Errorf("astra bundle not readable at %q (working dir %q): %w", bundlePath, cwd, err)
+	}
+
 	token := os.Getenv("CASSANDRA_DB_TOKEN")
 	keyspace := os.Getenv("CASSANDRA_DB_KEYSPACE")
 
