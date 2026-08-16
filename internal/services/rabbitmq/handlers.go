@@ -46,16 +46,24 @@ type PostData struct {
 type BulkFanoutPayload struct {
 	PostData        PostData `json:"post_data"`
 	CurrentEntityID string   `json:"current_entity_id"`
+	Type string `json:"type"`
 }
+const DefaultFanoutType = "fanout"
 
 
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// Every failure below abandons this one message and returns, matching how
+	// the rest of this file handles errors. A bad post id or a blipped
+	// connection is a property of the message, not of the worker, and must not
+	// take the process down — the other listeners are still serving their own
+	// queues from the same binary.
 	postRows, err := connections.Pool().Query(ctx, "SELECT * FROM newsfeed_post WHERE post_id = $1", post_id)
 	if err != nil {
-		log.Panicf("Failed to query post: %v", err)
+		log.Printf("update_ranking_score: failed to query post %s: %v\n", post_id, err)
+		return
 	}
 	postData, err := pgx.CollectOneRow(postRows, pgx.RowToStructByName[models.Post])
 	if err != nil {
@@ -63,12 +71,14 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 			log.Printf("No post found with ID: %s\n", post_id)
 			return
 		}
-		log.Panicf("Failed to parse post data: %v", err)
+		log.Printf("update_ranking_score: failed to parse post %s: %v\n", post_id, err)
+		return
 	}
 
 	scoreRows, err := connections.Pool().Query(ctx, "SELECT * FROM newsfeed_postscore WHERE post_id = $1", post_id)
 	if err != nil {
-		log.Panicf("Failed to query post score: %v", err)
+		log.Printf("update_ranking_score: failed to query score for post %s: %v\n", post_id, err)
+		return
 	}
 	postScore, err := pgx.CollectOneRow(scoreRows, pgx.RowToStructByName[models.PostScore])
 	
@@ -85,7 +95,8 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 				RankingScore:      0.0,
 			}
 		} else {
-			log.Panicf("Failed to parse post score data: %v", err)
+			log.Printf("update_ranking_score: failed to parse score for post %s: %v\n", post_id, err)
+			return
 		}
 	}
 
@@ -188,7 +199,8 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 		rankingScore,
 	)
 	if err != nil {
-		log.Panicf("Failed to execute upsert on post score: %v", err)
+		log.Printf("update_ranking_score: failed to upsert score for post %s: %v\n", post_id, err)
+		return
 	}
 
 	log.Printf("update_ranking_score: Successfully updated tracking score profile for Post ID: %s. Score: %f\n", post_id, rankingScore)
@@ -590,7 +602,11 @@ func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted ti
 	log.Printf("create_post_score_for_new_post: Successfully generated initial score profile for new Post ID: %s. Score: %f\n", postID, rankingScore)
 }
 
-func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData PostData) {
+func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData PostData, rowType string) {
+	if rowType == "" {
+		rowType = DefaultFanoutType
+	}
+
 	pgQuery := `
 		SELECT follower_id 
 		FROM entity_follow 
@@ -628,17 +644,18 @@ func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData Pos
 	batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
 
 	insertCQL := `
-		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id) 
-		VALUES (?, ?, ?, ?)`
+		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type)
+		VALUES (?, ?, ?, ?, ?)`
 
 	nowTimestamp := time.Now()
 
 	for _, followerID := range followerIDs {
-		batch.Query(insertCQL, 
+		batch.Query(insertCQL,
 			followerID,
 			postData.ID,
-			nowTimestamp, 
+			nowTimestamp,
 			postData.AuthorID,
+			rowType,
 		)
 	}
 
@@ -647,6 +664,6 @@ func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData Pos
 		return
 	}
 
-	log.Printf("bulk_fanout_to_cache: Successfully fanned out Post ID %s for entity %s to %d follower feeds in Astra DB.\n", 
-		postData.ID, currentEntityID, len(followerIDs))
+	log.Printf("bulk_fanout_to_cache: Successfully fanned out Post ID %s for entity %s to %d follower feeds in Astra DB (type=%s).\n",
+		postData.ID, currentEntityID, len(followerIDs), rowType)
 }

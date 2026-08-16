@@ -6,9 +6,21 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"runtime/debug"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+func Go(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[%s] recovered from panic: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
 
 // RabbitClient holds our connection infrastructure
 type RabbitMQ struct {

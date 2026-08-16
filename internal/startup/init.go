@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"time"
 	"worker_service/internal/connections"
-	"worker_service/internal/models"
 	"worker_service/internal/services/rabbitmq"
 )
 
@@ -36,18 +35,21 @@ func initialize_connections(){
 
 func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 	slog.Info("Initializing RabbitMQ background consumers...")
+	// Every consumer dispatches through rabbitmq.Go rather than a bare `go`, so
+	// a panic in one handler is logged with its stack and confined to that
+	// message instead of taking the process — and with it all seven listeners —
+	// down. Each callback declares its own `payload`, so closing over it is safe.
 	rmq.StartListener("update_ranking_score", func(body []byte) {
-		go func(msgBody []byte) {
-			var payload rabbitmq.UpdateRankingPayload
+		var payload rabbitmq.UpdateRankingPayload
 
-			err := json.Unmarshal(msgBody, &payload)
-			if err != nil {
-				log.Printf("Failed to unmarshal JSON payload: %v\n", err)
-				return
-			}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal JSON payload: %v\n", err)
+			return
+		}
 
+		rabbitmq.Go("update_ranking_score", func() {
 			rabbitmq.UpdateRankingScore(payload.PostID, payload.UpdateType, payload.IsDecrease)
-		}(body) 
+		})
 	})
 
 	rmq.StartListener("save_viewcache_engagements", func(body []byte) {
@@ -58,9 +60,9 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			return
 		}
 
-		go func(entity string, cache []models.ViewCacheItem) {
-			rabbitmq.SaveViewCacheEngagements(entity, cache)
-		}(payload.EntityID, payload.ViewCache)
+		rabbitmq.Go("save_viewcache_engagements", func() {
+			rabbitmq.SaveViewCacheEngagements(payload.EntityID, payload.ViewCache)
+		})
 	})
 
 	rmq.StartListener("bump_interest_affinity", func(body []byte) {
@@ -71,12 +73,12 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			return
 		}
 
-		go func(entity string, interests []string, action string, decrease bool) {
+		rabbitmq.Go("bump_interest_affinity", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			rabbitmq.BumpInterestAffinity(ctx, entity, interests, action, decrease)
-		}(payload.EntityID, payload.InterestIDs, payload.Action, payload.IsDecrease)
+			rabbitmq.BumpInterestAffinity(ctx, payload.EntityID, payload.InterestIDs, payload.Action, payload.IsDecrease)
+		})
 	})
 
 	rmq.StartListener("interaction_score_bump", func(body []byte) {
@@ -86,11 +88,11 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			return
 		}
 
-		go func(p rabbitmq.InteractionBumpPayload) {
+		rabbitmq.Go("interaction_score_bump", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			rabbitmq.InteractionScoreBump(ctx, p.ActorID, p.ReceiverID, p.Action, p.IsDecrease)
-		}(payload)
+			rabbitmq.InteractionScoreBump(ctx, payload.ActorID, payload.ReceiverID, payload.Action, payload.IsDecrease)
+		})
 	})
 
 	rmq.StartListener("follower_interaction_score_bump", func(body []byte) {
@@ -100,11 +102,11 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			return
 		}
 
-		go func(p rabbitmq.InteractionBumpPayload) {
+		rabbitmq.Go("follower_interaction_score_bump", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			rabbitmq.FollowerInteractionScoreBump(ctx, p.ActorID, p.ReceiverID, p.Action, p.IsDecrease)
-		}(payload)
+			rabbitmq.FollowerInteractionScoreBump(ctx, payload.ActorID, payload.ReceiverID, payload.Action, payload.IsDecrease)
+		})
 	})
 
 	rmq.StartListener("create_post_score_for_new_post", func(body []byte) {
@@ -114,20 +116,20 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			return
 		}
 
-		go func(p rabbitmq.NewPostCreatedPayload) {
+		rabbitmq.Go("create_post_score_for_new_post", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
 			djangoLayout := "2006-01-02 15:04:05.000 -0700"
-			
-			parsedTime, err := time.Parse(djangoLayout, p.DatePosted)
+
+			parsedTime, err := time.Parse(djangoLayout, payload.DatePosted)
 			if err != nil {
-				log.Printf("Failed to parse custom Django datetime string '%s': %v. Defaulting to time.Now()\n", p.DatePosted, err)
+				log.Printf("Failed to parse custom Django datetime string '%s': %v. Defaulting to time.Now()\n", payload.DatePosted, err)
 				parsedTime = time.Now()
 			}
 
-			rabbitmq.CreatePostScoreForNewPost(ctx, p.PostID, parsedTime)
-		}(payload)
+			rabbitmq.CreatePostScoreForNewPost(ctx, payload.PostID, parsedTime)
+		})
 	})
 
 	rmq.StartListener("bulk_fanout_to_cache", func(body []byte) {
@@ -137,11 +139,11 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			return
 		}
 
-		go func(p rabbitmq.BulkFanoutPayload) {
+		rabbitmq.Go("bulk_fanout_to_cache", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			
-			rabbitmq.BulkFanoutToCache(ctx, p.CurrentEntityID, p.PostData)
-		}(payload)
+
+			rabbitmq.BulkFanoutToCache(ctx, payload.CurrentEntityID, payload.PostData, payload.Type)
+		})
 	})
 }
