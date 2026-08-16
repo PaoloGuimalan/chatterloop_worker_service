@@ -33,6 +33,11 @@ type InteractionBumpPayload struct {
 	IsDecrease bool   `json:"is_decrease"`
 }
 
+type NewPostCreatedPayload struct {
+	PostID     string    `json:"post_id"`
+	DatePosted string `json:"date_posted"`
+}
+
 
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -489,4 +494,88 @@ func FollowerInteractionScoreBump(ctx context.Context, actorID string, receiverI
 	}
 
 	log.Printf("follower_interaction_score_bump: Follower Interaction Bump Recorded")
+}
+
+func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted time.Time) {
+	query := "SELECT reference_id, post_id, reference_media_type FROM newsfeed_postreference WHERE post_id = $1"
+	
+	rows, err := connections.Pool().Query(ctx, query, postID)
+	if err != nil {
+		log.Printf("Failed to query post references for ID %s: %v\n", postID, err)
+		return
+	}
+	defer rows.Close()
+
+	var mediaTypes []string
+	for rows.Next() {
+		var reference_id int64
+		var pid string
+		var mediaType string
+		if err := rows.Scan(&reference_id, &pid, &mediaType); err == nil {
+			mediaTypes = append(mediaTypes, mediaType)
+		}
+	}
+
+	contentTM := 1.0
+	referenceCount := float64(len(mediaTypes))
+
+	if referenceCount > 0 {
+		for _, mType := range mediaTypes {
+			switch mType {
+			case "image":
+				contentTM += 1.2
+			case "video":
+				contentTM += 1.5
+			default:
+				contentTM += 1.0
+			}
+		}
+	}
+
+	finalContentScore := contentTM / (referenceCount + 1.0)
+
+	ageHours := time.Since(datePosted).Hours()
+	affinityScore := 1.0
+	contentTypeWeight := finalContentScore
+	recentUpdateBoost := 1.0
+	commentsCount := 0
+	likesCount := 0
+	sharesCount := 0
+
+	weightedEngagement := float64(commentsCount)*3.0 + float64(likesCount)*1.0 + float64(sharesCount)*5.0
+	
+	decayFactor := math.Pow(ageHours+1.0, 1.2)
+	
+	rankingScore := (weightedEngagement / decayFactor) * affinityScore * contentTypeWeight * recentUpdateBoost
+
+	upsertQuery := `
+		INSERT INTO newsfeed_postscore (
+			post_id, affinity_score, content_type_weight, recent_update_boost, 
+			likes_count, comments_count, shares_count, ranking_score
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (post_id) DO UPDATE SET
+			affinity_score = EXCLUDED.affinity_score,
+			content_type_weight = EXCLUDED.content_type_weight,
+			recent_update_boost = EXCLUDED.recent_update_boost,
+			likes_count = EXCLUDED.likes_count,
+			comments_count = EXCLUDED.comments_count,
+			shares_count = EXCLUDED.shares_count,
+			ranking_score = EXCLUDED.ranking_score;`
+
+	_, err = connections.Pool().Exec(ctx, upsertQuery,
+		postID,
+		affinityScore,
+		contentTypeWeight,
+		recentUpdateBoost,
+		likesCount,
+		commentsCount,
+		sharesCount,
+		rankingScore,
+	)
+	if err != nil {
+		log.Printf("Failed to execute initial post score upsert for ID %s: %v\n", postID, err)
+		return
+	}
+
+	log.Printf("create_post_score_for_new_post: Successfully generated initial score profile for new Post ID: %s. Score: %f\n", postID, rankingScore)
 }

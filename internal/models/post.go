@@ -46,3 +46,10 @@ type PostScore struct {
 	SharesCount       uint64  `db:"shares_count"`
 	RankingScore      float64 `db:"ranking_score"`
 }
+
+type PostReference struct {
+	ID                 int64     `db:"id"`
+	PostID             string    `db:"post_id"`
+	ReferenceMediaType string    `db:"reference_media_type"` // "image", "video", etc.
+	CreatedAt          time.Time `db:"created_at"`
+}

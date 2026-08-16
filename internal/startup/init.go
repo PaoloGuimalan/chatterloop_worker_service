@@ -106,4 +106,27 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			rabbitmq.FollowerInteractionScoreBump(ctx, p.ActorID, p.ReceiverID, p.Action, p.IsDecrease)
 		}(payload)
 	})
+
+	rmq.StartListener("create_post_score_for_new_post", func(body []byte) {
+		var payload rabbitmq.NewPostCreatedPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal new post created payload: %v\n", err)
+			return
+		}
+
+		go func(p rabbitmq.NewPostCreatedPayload) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			djangoLayout := "2006-01-02 15:04:05.000 -0700"
+			
+			parsedTime, err := time.Parse(djangoLayout, p.DatePosted)
+			if err != nil {
+				log.Printf("Failed to parse custom Django datetime string '%s': %v. Defaulting to time.Now()\n", p.DatePosted, err)
+				parsedTime = time.Now()
+			}
+
+			rabbitmq.CreatePostScoreForNewPost(ctx, p.PostID, parsedTime)
+		}(payload)
+	})
 }
