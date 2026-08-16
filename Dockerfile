@@ -20,6 +20,8 @@ FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/worker /app/worker
 
+COPY secure-connect-chatterloop.zip /app/secure-connect-chatterloop.zip
+
 EXPOSE 8880
 USER nonroot:nonroot
 
