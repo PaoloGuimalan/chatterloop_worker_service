@@ -164,4 +164,19 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			rabbitmq.BackfillNewFriendFeed(ctx, payload.ViewerID, payload.NewFriendID, payload.Type)
 		})
 	})
+
+	rmq.StartListener("remove_feed_on_unfriend", func(body []byte) {
+		var payload rabbitmq.RemoveFeedPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal remove feed payload: %v\n", err)
+			return
+		}
+
+		rabbitmq.Go("remove_feed_on_unfriend", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			rabbitmq.RemoveFeedOnUnfriend(ctx, payload.ActorID, payload.AuthorID, payload.Type)
+		})
+	})
 }

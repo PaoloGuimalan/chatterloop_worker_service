@@ -59,6 +59,16 @@ type BackfillFriendFeedPayload struct {
 // How many of the new friend's posts are considered for the backfill.
 const BackfillCandidateLimit = 50
 
+type RemoveFeedPayload struct {
+	ActorID  string `json:"actor_id"`
+	AuthorID string `json:"author_id"`
+	Type     string `json:"type"`
+}
+
+// Deletes are chunked to stay under Cassandra's batch size threshold. Every row
+// shares one partition (bucket), so the batches themselves are cheap.
+const FeedDeleteChunkSize = 100
+
 
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -848,4 +858,80 @@ func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID str
 
 	log.Printf("backfill_new_friend_feed: Seeded %d of %d posts by %s into %s's timeline (type=%s).\n",
 		inserted, len(candidateIDs), newFriendID, viewerID, rowType)
+}
+
+// RemoveFeedOnUnfriend pulls one author's fanned-out posts back out of a
+// viewer's timeline — the inverse of BulkFanoutToCache, run on unfollow, block
+// and connection removal.
+func RemoveFeedOnUnfriend(ctx context.Context, actorID string, authorID string, rowType string) {
+	if rowType == "" {
+		rowType = DefaultFanoutType
+	}
+	if actorID == "" || authorID == "" {
+		return
+	}
+
+	session := connections.CassandraSession()
+	if session == nil {
+		log.Println("Astra DB disconnected. Skipping timeline cleanup.")
+		return
+	}
+
+	// bucket is the partition key, so this reads a single partition. author_id
+	// and type are regular columns, hence ALLOW FILTERING.
+	const selectCQL = `
+		SELECT post_id, created_at
+		FROM newsfeed_index
+		WHERE bucket = ? AND author_id = ? AND type = ?
+		ALLOW FILTERING`
+
+	type indexRow struct {
+		postID    string
+		createdAt time.Time
+	}
+
+	var doomed []indexRow
+
+	iter := session.Query(selectCQL, actorID, authorID, rowType).WithContext(ctx).Iter()
+
+	var postID string
+	var createdAt time.Time
+	for iter.Scan(&postID, &createdAt) {
+		doomed = append(doomed, indexRow{postID: postID, createdAt: createdAt})
+	}
+
+	if err := iter.Close(); err != nil {
+		log.Printf("remove_feed_on_unfriend: failed to scan bucket %s for author %s: %v\n", actorID, authorID, err)
+		return
+	}
+
+	if len(doomed) == 0 {
+		return
+	}
+
+	// Deleting needs the whole primary key: (bucket, post_id, created_at).
+	const deleteCQL = `DELETE FROM newsfeed_index WHERE bucket = ? AND post_id = ? AND created_at = ?`
+
+	removed := 0
+	for start := 0; start < len(doomed); start += FeedDeleteChunkSize {
+		end := start + FeedDeleteChunkSize
+		if end > len(doomed) {
+			end = len(doomed)
+		}
+
+		batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
+		for _, row := range doomed[start:end] {
+			batch.Query(deleteCQL, actorID, row.postID, row.createdAt)
+		}
+
+		if err := session.ExecuteBatch(batch); err != nil {
+			log.Printf("remove_feed_on_unfriend: batch delete failed for bucket %s after %d rows: %v\n", actorID, removed, err)
+			return
+		}
+
+		removed += end - start
+	}
+
+	log.Printf("remove_feed_on_unfriend: Removed %d rows authored by %s from %s's timeline (type=%s).\n",
+		removed, authorID, actorID, rowType)
 }
