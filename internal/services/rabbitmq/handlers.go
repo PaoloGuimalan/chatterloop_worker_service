@@ -45,7 +45,7 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 
 	postRows, err := connections.Pool().Query(ctx, "SELECT * FROM newsfeed_post WHERE post_id = $1", post_id)
 	if err != nil {
-		log.Fatalf("Failed to query post: %v", err)
+		log.Panicf("Failed to query post: %v", err)
 	}
 	postData, err := pgx.CollectOneRow(postRows, pgx.RowToStructByName[models.Post])
 	if err != nil {
@@ -53,12 +53,12 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 			log.Printf("No post found with ID: %s\n", post_id)
 			return
 		}
-		log.Fatalf("Failed to parse post data: %v", err)
+		log.Panicf("Failed to parse post data: %v", err)
 	}
 
 	scoreRows, err := connections.Pool().Query(ctx, "SELECT * FROM newsfeed_postscore WHERE post_id = $1", post_id)
 	if err != nil {
-		log.Fatalf("Failed to query post score: %v", err)
+		log.Panicf("Failed to query post score: %v", err)
 	}
 	postScore, err := pgx.CollectOneRow(scoreRows, pgx.RowToStructByName[models.PostScore])
 	
@@ -75,7 +75,7 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 				RankingScore:      0.0,
 			}
 		} else {
-			log.Fatalf("Failed to parse post score data: %v", err)
+			log.Panicf("Failed to parse post score data: %v", err)
 		}
 	}
 
@@ -178,7 +178,7 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 		rankingScore,
 	)
 	if err != nil {
-		log.Fatalf("Failed to execute upsert on post score: %v", err)
+		log.Panicf("Failed to execute upsert on post score: %v", err)
 	}
 
 	log.Printf("update_ranking_score: Successfully updated tracking score profile for Post ID: %s. Score: %f\n", post_id, rankingScore)
