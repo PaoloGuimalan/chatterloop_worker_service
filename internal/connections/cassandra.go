@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	gocqlastra "github.com/datastax/gocql-astra"
@@ -14,14 +15,38 @@ type Cassandra struct {
 	Session *gocql.Session
 }
 
+// requiredEnv reports the names of any variables that are absent or set to an
+// empty string, distinguishing the two — a missing line and `KEY=` have
+// different causes. Names only; values are never logged.
+func requiredEnv(names ...string) []string {
+	var problems []string
+	for _, name := range names {
+		value, present := os.LookupEnv(name)
+		switch {
+		case !present:
+			problems = append(problems, name+" (not set)")
+		case value == "":
+			problems = append(problems, name+" (set but empty)")
+		}
+	}
+	return problems
+}
+
 func (c *Cassandra) Connect(ctx context.Context) error {
+	// Named individually because this image is distroless: there is no shell to
+	// exec into and inspect the environment with, so this log line is the only
+	// diagnostic available in a deployed container.
+	if missing := requiredEnv(
+		"CASSANDRA_DB_BUNDLE",
+		"CASSANDRA_DB_TOKEN",
+		"CASSANDRA_DB_KEYSPACE",
+	); len(missing) > 0 {
+		return fmt.Errorf("cassandra config incomplete: %s", strings.Join(missing, ", "))
+	}
+
 	bundlePath := os.Getenv("CASSANDRA_DB_BUNDLE")
 	token := os.Getenv("CASSANDRA_DB_TOKEN")
 	keyspace := os.Getenv("CASSANDRA_DB_KEYSPACE")
-
-	if bundlePath == "" || token == "" || keyspace == "" {
-		return fmt.Errorf("missing one or more CASSANDRA_ environment variables")
-	}
 
 	cluster, err := gocqlastra.NewClusterFromBundle(bundlePath, "token", token, 10*time.Second)
 	if err != nil {
