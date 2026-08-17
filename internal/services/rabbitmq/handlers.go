@@ -65,6 +65,18 @@ type RemoveFeedPayload struct {
 	Type     string `json:"type"`
 }
 
+// One conversation's worth of bumps in a single message. InteractionBumpPayload
+// carries one receiver, which meant a group chat published one message per
+// member; this carries them all and resolves them in one statement.
+type ChatScoreBumpPayload struct {
+	ActorID    string   `json:"actor_id"`
+	MemberIDs  []string `json:"member_ids"`
+	Action     string   `json:"action"`
+	IsDecrease bool     `json:"is_decrease"`
+}
+
+const DefaultChatAction = "CHAT"
+
 // Deletes are chunked to stay under Cassandra's batch size threshold. Every row
 // shares one partition (bucket), so the batches themselves are cheap.
 const FeedDeleteChunkSize = 100
@@ -442,10 +454,11 @@ var interactionWeights = map[string]float64{
 	"NEW_CONNECTION": 10.0,
 	"SHARE":          7.0,
 	"REPOST":         7.0,
-	"COMMENT":        4.0,
-	"LIKE":           1.0,
-	"VIEW":           0.1,
-	"PROFILE_VISIT":  0.5,
+	"CHAT":          3.0,
+	"COMMENT":       4.0,
+	"LIKE":          1.0,
+	"VIEW":          0.1,
+	"PROFILE_VISIT": 0.5,
 }
 
 func InteractionScoreBump(ctx context.Context, actorID string, receiverID string, action string, isDecrease bool) {
@@ -537,6 +550,91 @@ func FollowerInteractionScoreBump(ctx context.Context, actorID string, receiverI
 	log.Printf("follower_interaction_score_bump: Follower Interaction Bump Recorded")
 }
 
+// BumpChatScore is InteractionScoreBump for an entire conversation.
+//
+// The chat path bumps the actor against every other member at once, which as
+// one-message-per-member meant N publishes, N handler invocations and N
+// transactions for a single sent message. Here the member list arrives whole
+// and every matching connection moves in one UPDATE.
+//
+// The 30-minute Redis lock that decides WHETHER to bump stays on the publisher:
+// it is per-conversation, and this handler has no idea a conversation exists.
+func BumpChatScore(ctx context.Context, actorID string, memberIDs []string, action string, isDecrease bool) {
+	if action == "" {
+		action = DefaultChatAction
+	}
+
+	if actorID == "" || len(memberIDs) == 0 {
+		return
+	}
+
+	weight, exists := interactionWeights[action]
+	if !exists || weight == 0.0 {
+		log.Printf("bump_chat_score: unknown action %q, nothing to do\n", action)
+		return
+	}
+
+	delta := weight
+	if isDecrease {
+		delta = -weight
+	}
+
+	// Deduplicated, and the actor dropped: nobody bumps a connection with
+	// themselves, and a member listed twice must not count twice - the
+	// per-member version got both of those from its early return.
+	seen := make(map[string]struct{}, len(memberIDs))
+	receivers := make([]string, 0, len(memberIDs))
+	for _, id := range memberIDs {
+		if id == "" || id == actorID {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		receivers = append(receivers, id)
+	}
+
+	if len(receivers) == 0 {
+		return
+	}
+
+	tx, err := connections.Pool().Begin(ctx)
+	if err != nil {
+		log.Printf("bump_chat_score: failed to begin transaction: %v\n", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	// Same shape as InteractionScoreBump's statement, with ANY($3) standing in
+	// for its single receiver so one round trip covers the whole conversation.
+	const query = `
+		UPDATE entity_connection
+		SET
+			interaction_score = interaction_score + $1,
+			last_interaction_at = NOW()
+		WHERE connection_id IN (
+			SELECT connection_id
+			FROM entity_connection
+			WHERE (action_by_id = $2 AND involved_entity_id = ANY($3))
+			   OR (involved_entity_id = $2 AND action_by_id = ANY($3))
+		)`
+
+	tag, err := tx.Exec(ctx, query, delta, actorID, receivers)
+	if err != nil {
+		log.Printf("bump_chat_score: failed to execute bump for actor %s: %v\n", actorID, err)
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("bump_chat_score: failed to commit: %v\n", err)
+		return
+	}
+
+	log.Printf("bump_chat_score: %d connection rows bumped for actor %s across %d members (action=%s)\n",
+		tag.RowsAffected(), actorID, len(receivers), action)
+}
+
 func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted time.Time) {
 	query := "SELECT reference_id, post_id, reference_media_type FROM newsfeed_postreference WHERE post_id = $1"
 	
@@ -557,6 +655,16 @@ func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted ti
 		}
 	}
 
+	// These constants reproduce the Node createpost block this handler replaced,
+	// deliberately and to the digit. Posts are only ever created by the chat
+	// server (routes/posts/index.js), so every existing newsfeed_postscore row
+	// was scored this way - and content_type_weight is PERSISTED and reused by
+	// UpdateRankingScore forever after, so a different scale here would leave
+	// new posts permanently incomparable with the corpus.
+	//
+	// The Django signal that also fed this queue used +1.2/+1.5 and decay ^1.2,
+	// but nothing in user_service ever creates a Post, so those numbers never
+	// reached a real row.
 	contentTM := 1.0
 	referenceCount := float64(len(mediaTypes))
 
@@ -564,18 +672,33 @@ func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted ti
 		for _, mType := range mediaTypes {
 			switch mType {
 			case "image":
-				contentTM += 1.2
+				contentTM += 6.5
 			case "video":
-				contentTM += 1.5
+				contentTM += 8.5
 			default:
-				contentTM += 1.0
+				contentTM += 2.0
 			}
 		}
+	} else {
+		// A text-only post is credited rather than left at the 1.0 floor.
+		contentTM += 4.0
 	}
 
 	finalContentScore := contentTM / (referenceCount + 1.0)
 
-	ageHours := time.Since(datePosted).Hours()
+	// Faithful to the original, which read
+	//   age_hours = currentTimestampInSeconds / (1000 * 60 * 60)
+	// i.e. epoch SECONDS over milliseconds-per-hour. That is not the post's age
+	// - it is ~496 for any post created today, and creeps up by ~8.8 per year -
+	// so every new post is divided by a decay of about 22.3 regardless of when
+	// it was written.
+	//
+	// Kept because the value only survives until the post's first interaction,
+	// at which point UpdateRankingScore recomputes it from the real elapsed
+	// time; changing it here would put new posts on a different scale from every
+	// untouched row already in the table. Fix it in a backfill that rewrites all
+	// of them together, not one post at a time.
+	ageHours := float64(datePosted.Unix()) / (1000.0 * 60.0 * 60.0)
 	affinityScore := 1.0
 	contentTypeWeight := finalContentScore
 	recentUpdateBoost := 1.0
@@ -583,10 +706,23 @@ func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted ti
 	likesCount := 0
 	sharesCount := 0
 
-	weightedEngagement := float64(commentsCount)*3.0 + float64(likesCount)*1.0 + float64(sharesCount)*5.0
-	
-	decayFactor := math.Pow(ageHours+1.0, 1.2)
-	
+	// A new post has no engagement, so without this term the numerator is zero
+	// and every post is created with ranking_score 0.0 - bottom of every ranked
+	// feed, seen by nobody, therefore never interacted with, therefore never
+	// lifted out of it. The base term is what gives a post its opening position,
+	// earned from its content weight alone.
+	//
+	// UpdateRankingScore already carries the same 1.0, so this also stops a
+	// post's score jumping the first time anyone reacts to it.
+	baseEngagement := 1.0
+
+	weightedEngagement := float64(commentsCount)*3.0 + float64(likesCount)*1.0 + float64(sharesCount)*5.0 + baseEngagement
+
+	// ^0.5, matching UpdateRankingScore. The ^1.2 this used to carry came from
+	// the Django signal and made a post's score jump the first time anyone
+	// touched it, since the two handlers then decayed it differently.
+	decayFactor := math.Pow(ageHours+1.0, 0.5)
+
 	rankingScore := (weightedEngagement / decayFactor) * affinityScore * contentTypeWeight * recentUpdateBoost
 
 	upsertQuery := `

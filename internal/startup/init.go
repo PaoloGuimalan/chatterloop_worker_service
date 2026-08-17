@@ -165,6 +165,21 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 		})
 	})
 
+	rmq.StartListener("bump_chat_score", func(body []byte) {
+		var payload rabbitmq.ChatScoreBumpPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal chat score bump payload: %v\n", err)
+			return
+		}
+
+		rabbitmq.Go("bump_chat_score", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			rabbitmq.BumpChatScore(ctx, payload.ActorID, payload.MemberIDs, payload.Action, payload.IsDecrease)
+		})
+	})
+
 	rmq.StartListener("remove_feed_on_unfriend", func(body []byte) {
 		var payload rabbitmq.RemoveFeedPayload
 		if err := json.Unmarshal(body, &payload); err != nil {
