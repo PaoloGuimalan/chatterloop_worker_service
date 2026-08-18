@@ -165,6 +165,20 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 		})
 	})
 
+	rmq.StartListener("send_email", func(body []byte) {
+		var payload rabbitmq.SendEmailPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal send email payload: %v\n", err)
+			return
+		}
+
+		// No ctx: net/smtp has no context-aware API, and the send is bounded by
+		// the SMTP dial timeout instead.
+		rabbitmq.Go("send_email", func() {
+			rabbitmq.SendEmail(payload.To, payload.From, payload.Subject, payload.Body)
+		})
+	})
+
 	rmq.StartListener("remove_engagement_log", func(body []byte) {
 		var payload rabbitmq.RemoveEngagementLogPayload
 		if err := json.Unmarshal(body, &payload); err != nil {
