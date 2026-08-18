@@ -165,6 +165,22 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 		})
 	})
 
+	rmq.StartListener("remove_engagement_log", func(body []byte) {
+		var payload rabbitmq.RemoveEngagementLogPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal remove engagement log payload: %v\n", err)
+			return
+		}
+
+		rabbitmq.Go("remove_engagement_log", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			rabbitmq.RemoveEngagementLog(ctx, payload.EntityID, payload.ActivityType,
+				payload.TargetType, payload.TargetID)
+		})
+	})
+
 	rmq.StartListener("bump_chat_score", func(body []byte) {
 		var payload rabbitmq.ChatScoreBumpPayload
 		if err := json.Unmarshal(body, &payload); err != nil {

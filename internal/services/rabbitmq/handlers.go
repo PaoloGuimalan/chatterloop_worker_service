@@ -81,6 +81,16 @@ const DefaultChatAction = "CHAT"
 // shares one partition (bucket), so the batches themselves are cheap.
 const FeedDeleteChunkSize = 100
 
+// Retracts the engagement log written when a comment or reaction was created.
+// One payload for both, since the receivers differ only in activity_type and
+// which id they point at.
+type RemoveEngagementLogPayload struct {
+	EntityID     string `json:"entity_id"`
+	ActivityType string `json:"activity_type"`
+	TargetType   string `json:"target_type"`
+	TargetID     string `json:"target_id"`
+}
+
 
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1070,4 +1080,88 @@ func RemoveFeedOnUnfriend(ctx context.Context, actorID string, authorID string, 
 
 	log.Printf("remove_feed_on_unfriend: Removed %d rows authored by %s from %s's timeline (type=%s).\n",
 		removed, authorID, actorID, rowType)
+}
+
+// RemoveEngagementLog retracts the user_engagement_log rows written when a
+// comment or reaction was created, once that row is gone from Postgres.
+//
+// Select-then-delete, not a single delete: the primary key is
+// (user_id, log_id, activity_time), but the caller only knows activity_type and
+// target_id, which are regular columns. The rows must be read to learn their
+// keys - which is what the Django receivers did too, one round trip per row.
+// Here they come back in one query and leave in one batch.
+func RemoveEngagementLog(ctx context.Context, entityID, activityType, targetType, targetID string) {
+	if entityID == "" || activityType == "" || targetID == "" {
+		return
+	}
+
+	userID, err := gocql.ParseUUID(entityID)
+	if err != nil {
+		log.Printf("remove_engagement_log: invalid entity uuid %q: %v\n", entityID, err)
+		return
+	}
+
+	session := connections.CassandraSession()
+	if session == nil {
+		log.Println("Astra DB disconnected. Skipping engagement log cleanup.")
+		return
+	}
+
+	// user_id is the partition key, so this reads one partition; the rest are
+	// regular columns, hence ALLOW FILTERING.
+	const selectCQL = `
+		SELECT log_id, activity_time
+		FROM user_engagement_log
+		WHERE user_id = ? AND activity_type = ? AND target_type = ? AND target_id = ?
+		ALLOW FILTERING`
+
+	type logRow struct {
+		logID        gocql.UUID
+		activityTime time.Time
+	}
+
+	var doomed []logRow
+
+	iter := session.Query(selectCQL, userID, activityType, targetType, targetID).
+		WithContext(ctx).Iter()
+
+	var logID gocql.UUID
+	var activityTime time.Time
+	for iter.Scan(&logID, &activityTime) {
+		doomed = append(doomed, logRow{logID: logID, activityTime: activityTime})
+	}
+
+	if err := iter.Close(); err != nil {
+		log.Printf("remove_engagement_log: scan failed for %s/%s: %v\n", entityID, targetID, err)
+		return
+	}
+
+	if len(doomed) == 0 {
+		return
+	}
+
+	const deleteCQL = `DELETE FROM user_engagement_log WHERE user_id = ? AND log_id = ? AND activity_time = ?`
+
+	removed := 0
+	for start := 0; start < len(doomed); start += FeedDeleteChunkSize {
+		end := start + FeedDeleteChunkSize
+		if end > len(doomed) {
+			end = len(doomed)
+		}
+
+		batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
+		for _, row := range doomed[start:end] {
+			batch.Query(deleteCQL, userID, row.logID, row.activityTime)
+		}
+
+		if err := session.ExecuteBatch(batch); err != nil {
+			log.Printf("remove_engagement_log: batch delete failed for %s after %d rows: %v\n", entityID, removed, err)
+			return
+		}
+
+		removed += end - start
+	}
+
+	log.Printf("remove_engagement_log: Removed %d %s log rows for target %s (entity %s).\n",
+		removed, activityType, targetID, entityID)
 }
