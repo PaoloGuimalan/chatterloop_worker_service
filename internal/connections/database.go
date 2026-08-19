@@ -14,6 +14,7 @@ type Database interface {
 
 var Active Database
 var ActiveCassandra Database
+var ActiveMongo Database
 
 var registry = make(map[string]Database)
 
@@ -36,6 +37,8 @@ func Open(ctx context.Context, name string, db Database) error {
 			Active = db
 		case "cassandra":
 			ActiveCassandra = db
+		case "mongo":
+			ActiveMongo = db
 	}
 
 	return nil

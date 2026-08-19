@@ -25,6 +25,11 @@ func initialize_connections(){
 		log.Fatalf("Critical database initialization failed: %v", err)
 	}
 
+	mongoClient := &connections.Mongo{}
+	if err := connections.Open(context.Background(), "mongo", mongoClient); err != nil {
+		log.Printf("Mongo unavailable, push notifications will be dropped: %v", err)
+	}
+
 	rmq, err := rabbitmq.RabbitClient()
 	if err != nil {
 		log.Fatalf("Initialization failed: %v", err)
@@ -35,10 +40,6 @@ func initialize_connections(){
 
 func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 	slog.Info("Initializing RabbitMQ background consumers...")
-	// Every consumer dispatches through rabbitmq.Go rather than a bare `go`, so
-	// a panic in one handler is logged with its stack and confined to that
-	// message instead of taking the process — and with it every other listener —
-	// down. Each callback declares its own `payload`, so closing over it is safe.
 	rmq.StartListener("update_ranking_score", func(body []byte) {
 		var payload rabbitmq.UpdateRankingPayload
 
@@ -120,8 +121,6 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			// RFC3339, same as view_cache's created_at — one datetime format
-			// across the service. Publishers send datetime.isoformat().
 			parsedTime := time.Now()
 			if payload.DatePosted != "" {
 				if t, err := time.Parse(time.RFC3339, payload.DatePosted); err == nil {
@@ -165,6 +164,21 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 		})
 	})
 
+	rmq.StartListener("send_push", func(body []byte) {
+		var payload rabbitmq.SendPushPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Failed to unmarshal send push payload: %v\n", err)
+			return
+		}
+
+		rabbitmq.Go("send_push", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			rabbitmq.SendPush(ctx, payload)
+		})
+	})
+
 	rmq.StartListener("send_email", func(body []byte) {
 		var payload rabbitmq.SendEmailPayload
 		if err := json.Unmarshal(body, &payload); err != nil {
@@ -172,8 +186,6 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ){
 			return
 		}
 
-		// No ctx: net/smtp has no context-aware API, and the send is bounded by
-		// the SMTP dial timeout instead.
 		rabbitmq.Go("send_email", func() {
 			rabbitmq.SendEmail(payload.To, payload.From, payload.Subject, payload.Body)
 		})
