@@ -32,7 +32,14 @@ type Post struct {
 	DatePosted    time.Time     `db:"date_posted"`
 	FromSystem    bool          `db:"from_system"`
 	DeletedAt     sql.NullTime  `db:"deleted_at"` // DateTime field that allows NULL
-	DeletedByID   sql.NullInt64 `db:"deleted_by_id"` // Foreign Key that allows NULL
+	// NullString, not NullInt64. The column is varchar - it held Account ids
+	// (varchar) before newsfeed/0009 repointed it and Entity ids (varchar)
+	// after - so the int type was always wrong. It went unnoticed because
+	// UpdateRankingScore does SELECT *, and a NULL scans cleanly into any
+	// Null* type: every post the worker had touched happened to have no
+	// deleter. A post that HAS one - the 29 already in this database, and
+	// every one the moderation service removes - failed to parse.
+	DeletedByID sql.NullString `db:"deleted_by_id"` // Foreign Key that allows NULL
 }
 
 type PostScore struct {
