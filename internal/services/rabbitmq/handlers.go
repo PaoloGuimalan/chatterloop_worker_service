@@ -19,11 +19,17 @@ type UpdateRankingPayload struct {
     IsDecrease bool	`json:"is_decrease"`
 }
 
+// InterestIDs are int64, not strings: interests_interest.id is a bigint
+// (Django's default AutoField pk), so newsfeed/views.py and the diary
+// publishers put JSON NUMBERS on the wire. Declared as []string the whole
+// payload failed to unmarshal, and because the listener consumes with autoAck
+// the message was already acked and simply vanished - every LIKE, COMMENT and
+// DIARY_TAG affinity bump was dropped without a trace.
 type BumpInterestAffinityPayload struct {
-	EntityID   string   `json:"entity_id"`
-	InterestIDs []string `json:"interest_ids"`
-	Action     string   `json:"action"`
-	IsDecrease bool     `json:"is_decrease"`
+	EntityID    string  `json:"entity_id"`
+	InterestIDs []int64 `json:"interest_ids"`
+	Action      string  `json:"action"`
+	IsDecrease  bool    `json:"is_decrease"`
 }
 
 type InteractionBumpPayload struct {
@@ -271,7 +277,7 @@ func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem)
 		viewedPostIDs = append(viewedPostIDs, view.PostID)
 	}
 
-	interestsByPostID := make(map[string][]string)
+	interestsByPostID := make(map[string][]int64)
 	
 	pgQuery := `
 		SELECT pil.post_id, pil.interest_id 
@@ -286,17 +292,24 @@ func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem)
 	defer pgRows.Close()
 
 	for pgRows.Next() {
-		var pid, interestID string
-		if err := pgRows.Scan(&pid, &interestID); err == nil {
-			interestsByPostID[pid] = append(interestsByPostID[pid], interestID)
-			log.Println(interestsByPostID[pid], interestID)
+		// post_id is a varchar, interest_id a bigint. Scanning the bigint into
+		// a string failed on EVERY row, and the `err == nil` with no else
+		// branch threw the error away - so the map stayed empty, allInterestIDs
+		// stayed empty, and the VIEW affinity bump below never once ran. The
+		// swallow is why that was invisible, so the error is logged now.
+		var pid string
+		var interestID int64
+		if err := pgRows.Scan(&pid, &interestID); err != nil {
+			log.Printf("Failed to scan post interest link row: %v\n", err)
+			continue
 		}
+		interestsByPostID[pid] = append(interestsByPostID[pid], interestID)
 	}
 
 	var logsToCreate []models.UserEngagementLog
 	var postIDsToClean []string
 
-	var allInterestIDs []string
+	var allInterestIDs []int64
 
 	for _, view := range viewCache {
 		pid := view.PostID
@@ -337,7 +350,7 @@ func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem)
 	}
 
 	if len(allInterestIDs) > 0 {
-		go func(id string, interests []string) {
+		go func(id string, interests []int64) {
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			
@@ -381,7 +394,7 @@ func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem)
 	return logsToCreate
 }
 
-func BumpInterestAffinity(ctx context.Context, entityID string, interestIDs []string, action string, isDecrease bool) {
+func BumpInterestAffinity(ctx context.Context, entityID string, interestIDs []int64, action string, isDecrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	
@@ -405,9 +418,11 @@ func BumpInterestAffinity(ctx context.Context, entityID string, interestIDs []st
 		return
 	}
 
-	uniqueInterests := make(map[string]struct{})
+	uniqueInterests := make(map[int64]struct{})
 	for _, id := range interestIDs {
-		if id != "" {
+		// 0 is not a valid bigint pk, so it means "absent" here exactly as the
+		// empty string did while these were typed as strings.
+		if id != 0 {
 			uniqueInterests[id] = struct{}{}
 		}
 	}
@@ -447,7 +462,7 @@ func BumpInterestAffinity(ctx context.Context, entityID string, interestIDs []st
 
 		_, err = tx.Exec(ctx, trendingUpsert, interestID, delta)
 		if err != nil {
-			log.Printf("Failed atomic trending execution on interest %s metrics: %v\n", interestID, err)
+			log.Printf("Failed atomic trending execution on interest %d metrics: %v\n", interestID, err)
 			return
 		}
 	}
