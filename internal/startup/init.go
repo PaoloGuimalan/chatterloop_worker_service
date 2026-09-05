@@ -3,6 +3,7 @@ package startup
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"log/slog"
 	"time"
@@ -10,11 +11,11 @@ import (
 	"worker_service/internal/services/rabbitmq"
 )
 
-func Init(){
+func Init() {
 	initialize_connections()
 }
 
-func initialize_connections(){
+func initialize_connections() {
 	pgClient := &connections.Postgres{}
 	if err := connections.Open(context.Background(), "postgres", pgClient); err != nil {
 		log.Fatalf("Critical database initialization failed: %v", err)
@@ -38,202 +39,152 @@ func initialize_connections(){
 	initialize_consumers(rmq)
 }
 
-func initialize_consumers(rmq *rabbitmq.RabbitMQ){
+// handle adapts a typed worker function into a rabbitmq.HandlerFunc. Malformed
+// JSON is permanent, so it is reported as ErrDrop and acked away instead of
+// being requeued forever.
+func handle[T any](fn func(ctx context.Context, payload T)) rabbitmq.HandlerFunc {
+	return func(ctx context.Context, body []byte) error {
+		var payload T
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return fmt.Errorf("%w: %v", rabbitmq.ErrDrop, err)
+		}
+
+		fn(ctx, payload)
+
+		return nil
+	}
+}
+
+// initialize_consumers registers every queue subscription, then starts them
+// together. Timeout is the per-message deadline; Workers caps how many messages
+// from that queue run at once, which keeps a large backlog from stampeding
+// Postgres, Astra and Mongo on restart.
+func initialize_consumers(rmq *rabbitmq.RabbitMQ) {
 	slog.Info("Initializing RabbitMQ background consumers...")
-	rmq.StartListener("update_ranking_score", func(body []byte) {
-		var payload rabbitmq.UpdateRankingPayload
 
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal JSON payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("update_ranking_score", func() {
-			rabbitmq.UpdateRankingScore(payload.PostID, payload.UpdateType, payload.IsDecrease)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "update_ranking_score",
+		Timeout: 10 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.UpdateRankingPayload) {
+			rabbitmq.UpdateRankingScore(p.PostID, p.UpdateType, p.IsDecrease)
+		}),
 	})
 
-	rmq.StartListener("save_viewcache_engagements", func(body []byte) {
-		var payload rabbitmq.ViewCachePayload
-
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal view cache JSON payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("save_viewcache_engagements", func() {
-			rabbitmq.SaveViewCacheEngagements(payload.EntityID, payload.ViewCache)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "save_viewcache_engagements",
+		Timeout: 30 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.ViewCachePayload) {
+			rabbitmq.SaveViewCacheEngagements(p.EntityID, p.ViewCache)
+		}),
 	})
 
-	rmq.StartListener("bump_interest_affinity", func(body []byte) {
-		var payload rabbitmq.BumpInterestAffinityPayload
-
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal bump interest affinity payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("bump_interest_affinity", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			rabbitmq.BumpInterestAffinity(ctx, payload.EntityID, payload.InterestIDs, payload.Action, payload.IsDecrease)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "bump_interest_affinity",
+		Timeout: 5 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.BumpInterestAffinityPayload) {
+			rabbitmq.BumpInterestAffinity(ctx, p.EntityID, p.InterestIDs, p.Action, p.IsDecrease)
+		}),
 	})
 
-	rmq.StartListener("interaction_score_bump", func(body []byte) {
-		var payload rabbitmq.InteractionBumpPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal connection interaction payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("interaction_score_bump", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			rabbitmq.InteractionScoreBump(ctx, payload.ActorID, payload.ReceiverID, payload.Action, payload.IsDecrease)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "interaction_score_bump",
+		Timeout: 5 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.InteractionBumpPayload) {
+			rabbitmq.InteractionScoreBump(ctx, p.ActorID, p.ReceiverID, p.Action, p.IsDecrease)
+		}),
 	})
 
-	rmq.StartListener("follower_interaction_score_bump", func(body []byte) {
-		var payload rabbitmq.InteractionBumpPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal follower interaction payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("follower_interaction_score_bump", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			rabbitmq.FollowerInteractionScoreBump(ctx, payload.ActorID, payload.ReceiverID, payload.Action, payload.IsDecrease)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "follower_interaction_score_bump",
+		Timeout: 5 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.InteractionBumpPayload) {
+			rabbitmq.FollowerInteractionScoreBump(ctx, p.ActorID, p.ReceiverID, p.Action, p.IsDecrease)
+		}),
 	})
 
-	rmq.StartListener("create_post_score_for_new_post", func(body []byte) {
-		var payload rabbitmq.NewPostCreatedPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal new post created payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("create_post_score_for_new_post", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "create_post_score_for_new_post",
+		Timeout: 5 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.NewPostCreatedPayload) {
 			parsedTime := time.Now()
-			if payload.DatePosted != "" {
-				if t, err := time.Parse(time.RFC3339, payload.DatePosted); err == nil {
+			if p.DatePosted != "" {
+				if t, err := time.Parse(time.RFC3339, p.DatePosted); err == nil {
 					parsedTime = t
 				} else {
-					log.Printf("Failed to parse date_posted '%s': %v. Defaulting to time.Now()\n", payload.DatePosted, err)
+					log.Printf("Failed to parse date_posted '%s': %v. Defaulting to time.Now()\n", p.DatePosted, err)
 				}
 			}
 
-			rabbitmq.CreatePostScoreForNewPost(ctx, payload.PostID, parsedTime)
-		})
+			rabbitmq.CreatePostScoreForNewPost(ctx, p.PostID, parsedTime)
+		}),
 	})
 
-	rmq.StartListener("bulk_fanout_to_cache", func(body []byte) {
-		var payload rabbitmq.BulkFanoutPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal bulk fanout payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("bulk_fanout_to_cache", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-
-			rabbitmq.BulkFanoutToCache(ctx, payload.CurrentEntityID, payload.PostData, payload.Type)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "bulk_fanout_to_cache",
+		Timeout: 10 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.BulkFanoutPayload) {
+			rabbitmq.BulkFanoutToCache(ctx, p.CurrentEntityID, p.PostData, p.Type)
+		}),
 	})
 
-	rmq.StartListener("backfill_new_friend_feed", func(body []byte) {
-		var payload rabbitmq.BackfillFriendFeedPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal backfill friend feed payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("backfill_new_friend_feed", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-
-			rabbitmq.BackfillNewFriendFeed(ctx, payload.ViewerID, payload.NewFriendID, payload.Type)
-		})
+	// Fan-out over a whole friend graph is the heaviest job here, so it runs with
+	// a small window to avoid saturating Astra.
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:    "backfill_new_friend_feed",
+		Timeout:  20 * time.Second,
+		Prefetch: 4,
+		Workers:  2,
+		Handler: handle(func(ctx context.Context, p rabbitmq.BackfillFriendFeedPayload) {
+			rabbitmq.BackfillNewFriendFeed(ctx, p.ViewerID, p.NewFriendID, p.Type)
+		}),
 	})
 
-	rmq.StartListener("send_push", func(body []byte) {
-		var payload rabbitmq.SendPushPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal send push payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("send_push", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-
-			rabbitmq.SendPush(ctx, payload)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "send_push",
+		Timeout: 30 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.SendPushPayload) {
+			rabbitmq.SendPush(ctx, p)
+		}),
 	})
 
-	rmq.StartListener("send_email", func(body []byte) {
-		var payload rabbitmq.SendEmailPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal send email payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("send_email", func() {
-			rabbitmq.SendEmail(payload.To, payload.From, payload.Subject, payload.Body)
-		})
+	// SMTP is slow and the relay dislikes parallel sessions.
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:    "send_email",
+		Timeout:  30 * time.Second,
+		Prefetch: 4,
+		Workers:  2,
+		Handler: handle(func(ctx context.Context, p rabbitmq.SendEmailPayload) {
+			rabbitmq.SendEmail(p.To, p.From, p.Subject, p.Body)
+		}),
 	})
 
-	rmq.StartListener("remove_engagement_log", func(body []byte) {
-		var payload rabbitmq.RemoveEngagementLogPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal remove engagement log payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("remove_engagement_log", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-
-			rabbitmq.RemoveEngagementLog(ctx, payload.EntityID, payload.ActivityType,
-				payload.TargetType, payload.TargetID)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "remove_engagement_log",
+		Timeout: 10 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.RemoveEngagementLogPayload) {
+			rabbitmq.RemoveEngagementLog(ctx, p.EntityID, p.ActivityType, p.TargetType, p.TargetID)
+		}),
 	})
 
-	rmq.StartListener("bump_chat_score", func(body []byte) {
-		var payload rabbitmq.ChatScoreBumpPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal chat score bump payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("bump_chat_score", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			rabbitmq.BumpChatScore(ctx, payload.ActorID, payload.MemberIDs, payload.Action, payload.IsDecrease)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "bump_chat_score",
+		Timeout: 5 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.ChatScoreBumpPayload) {
+			rabbitmq.BumpChatScore(ctx, p.ActorID, p.MemberIDs, p.Action, p.IsDecrease)
+		}),
 	})
 
-	rmq.StartListener("remove_feed_on_unfriend", func(body []byte) {
-		var payload rabbitmq.RemoveFeedPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			log.Printf("Failed to unmarshal remove feed payload: %v\n", err)
-			return
-		}
-
-		rabbitmq.Go("remove_feed_on_unfriend", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-
-			rabbitmq.RemoveFeedOnUnfriend(ctx, payload.ActorID, payload.AuthorID, payload.Type)
-		})
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "remove_feed_on_unfriend",
+		Timeout: 10 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.RemoveFeedPayload) {
+			rabbitmq.RemoveFeedOnUnfriend(ctx, p.ActorID, p.AuthorID, p.Type)
+		}),
 	})
+
+	// Fatal on purpose: a worker that boots without consumers looks healthy while
+	// every queue silently backs up.
+	if err := rmq.Start(); err != nil {
+		log.Fatalf("Failed to start RabbitMQ consumers: %v", err)
+	}
 }

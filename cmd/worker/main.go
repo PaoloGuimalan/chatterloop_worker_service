@@ -1,9 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
 	"worker_service/internal/connections"
 	"worker_service/internal/endpoints"
 	"worker_service/internal/logger"
@@ -14,19 +21,21 @@ import (
 	"github.com/joho/godotenv"
 )
 
-func main(){
+const shutdownTimeout = 30 * time.Second
+
+func main() {
 	logger.Setup(slog.LevelInfo)
 	godotenv.Load()
 
 	const art = `
 
 
-	 ██████╗██╗  ██╗ █████╗ ████████╗████████╗███████╗██████╗ ██╗       █████╗   █████╗  █████╗ 
+	 ██████╗██╗  ██╗ █████╗ ████████╗████████╗███████╗██████╗ ██╗       █████╗   █████╗  █████╗
 	██╔════╝██║  ██║██╔══██╗╚══██╔══╝╚══██╔══╝██╔════╝██╔══██╗██║     ██╔═══██╗██╔═══██╗██╔══██╗
 	██║     ███████║███████║   ██║      ██║   █████╗  ██████╔╝██║     ██║   ██║██║   ██║██████╔╝
-	██║     ██╔══██║██╔══██║   ██║      ██║   ██╔══╝  ██╔══██╗██║     ██║   ██║██║   ██║██╔═══╝ 
-	╚██████╗██║  ██║██║  ██║   ██║      ██║   ███████╗██║  ██║███████╗╚██████╔╝╚██████╔╝██║     
-	 ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝     
+	██║     ██╔══██║██╔══██║   ██║      ██║   ██╔══╝  ██╔══██╗██║     ██║   ██║██║   ██║██╔═══╝
+	╚██████╗██║  ██║██║  ██║   ██║      ██║   ███████╗██║  ██║███████╗╚██████╔╝╚██████╔╝██║
+	 ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝
 
 
 	`
@@ -34,16 +43,43 @@ func main(){
 	log.Println(art)
 
 	startup.Init()
-	defer connections.CloseAll()
-	defer rabbitmq.ActiveRabbitMQ.Close()
-	
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", endpoints.HealthCheckHandler)
-	mux.HandleFunc("/status", endpoints.DatabaseStatusHandler)
+	mux.HandleFunc("/status", endpoints.StatusHandler)
 
-	log.Println("🚀 API Server started on http://localhost:8880")
-
-	if err := http.ListenAndServe(":8880", middlewares.Requests(mux)); err != nil {
-		slog.Error("server stopped", "err", err)
+	server := &http.Server{
+		Addr:    ":8880",
+		Handler: middlewares.Requests(mux),
 	}
+
+	// SIGTERM is what the orchestrator sends on redeploy. Catching it lets
+	// in-flight handlers finish so their messages are acked rather than
+	// redelivered on the next boot.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Println("🚀 API Server started on http://localhost:8880")
+
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server stopped", "err", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("Shutdown signal received, draining in-flight work...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Error("http shutdown failed", "err", err)
+	}
+
+	rabbitmq.ActiveRabbitMQ.Close()
+	connections.CloseAll()
+
+	slog.Info("Shutdown complete")
 }
