@@ -54,7 +54,21 @@ type BulkFanoutPayload struct {
 	CurrentEntityID string   `json:"current_entity_id"`
 	Type string `json:"type"`
 }
+
+// Why a row is in someone's feed, stored as newsfeed_index.type and read back
+// by the newsfeed to caption the post ("@handle commented on this post").
+//
+//	fanout  - you follow the author. The ordinary case and the DEFAULT, and
+//	          the one the feed shows no caption for: "you follow them" is not
+//	          a reason worth explaining.
+//	comment - somebody you follow commented on it, which is what pulled a post
+//	          by someone you may not follow at all into your feed.
+//
+// Anything else a publisher sends is stored as-is and simply captions nothing
+// on a client that does not know it, so adding a reason is a publisher change
+// rather than a client one.
 const DefaultFanoutType = "fanout"
+const CommentFanoutType = "comment"
 
 type BackfillFriendFeedPayload struct {
 	ViewerID    string `json:"viewer_id"`
@@ -824,8 +838,8 @@ func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData Pos
 	batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
 
 	insertCQL := `
-		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type)
-		VALUES (?, ?, ?, ?, ?)`
+		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type, triggered_by)
+		VALUES (?, ?, ?, ?, ?, ?)`
 
 	nowTimestamp := time.Now()
 
@@ -836,6 +850,18 @@ func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData Pos
 			nowTimestamp,
 			postData.AuthorID,
 			rowType,
+			// WHO put this in front of you, which is not always the author:
+			// currentEntityID owns the follower buckets being written, so on a
+			// comment bump it is the COMMENTER while author_id stays the post's
+			// writer. That distinction is the whole point of the caption - it
+			// is what lets the feed say "@handle commented on this post"
+			// instead of implying you follow someone you do not.
+			//
+			// Derived rather than carried in the payload: "whose followers get
+			// this row" and "who caused it" are the same entity by definition
+			// on every path that fans out, so a separate field could only ever
+			// disagree with this one.
+			currentEntityID,
 		)
 	}
 
@@ -993,8 +1019,8 @@ func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID str
 	batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
 
 	const insertCQL = `
-		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type)
-		VALUES (?, ?, ?, ?, ?)`
+		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type, triggered_by)
+		VALUES (?, ?, ?, ?, ?, ?)`
 
 	nowTimestamp := time.Now()
 	inserted := 0
@@ -1003,7 +1029,11 @@ func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID str
 		if _, alreadyEngaged := skip[pid]; alreadyEngaged {
 			continue
 		}
-		batch.Query(insertCQL, viewerID, pid, nowTimestamp, newFriendID, rowType)
+		// triggered_by is the new friend here, same as author_id: these rows
+		// exist because the viewer just started following THEM, and they wrote
+		// every one of the posts. Kept explicit rather than left null so every
+		// row in the table answers "who put this here".
+		batch.Query(insertCQL, viewerID, pid, nowTimestamp, newFriendID, rowType, newFriendID)
 		inserted++
 	}
 
@@ -1038,12 +1068,29 @@ func RemoveFeedOnUnfriend(ctx context.Context, actorID string, authorID string, 
 		return
 	}
 
-	// bucket is the partition key, so this reads a single partition. author_id
-	// and type are regular columns, hence ALLOW FILTERING.
-	const selectCQL = `
+	// bucket is the partition key, so both of these read a single partition.
+	// The rest are regular columns, hence ALLOW FILTERING.
+	const byAuthorCQL = `
 		SELECT post_id, created_at
 		FROM newsfeed_index
 		WHERE bucket = ? AND author_id = ? AND type = ?
+		ALLOW FILTERING`
+
+	// The other way a row lands in this bucket because of authorID: they
+	// COMMENTED on somebody else's post, which fanned it here with
+	// triggered_by = them (see BulkFanoutToCache). Those rows are authored by
+	// a third party, so the query above cannot see them - and leaving them
+	// behind means the feed keeps captioning posts "@handle commented on
+	// this" for somebody the viewer has just stopped following.
+	//
+	// Fanout rows are dropped from this pass in Go rather than in CQL: a
+	// fanout row always has triggered_by == author_id, so it is either already
+	// covered by the query above or belongs to a follow that still stands.
+	// Cassandra has no OR, which is why this is a second query at all.
+	const byTriggerCQL = `
+		SELECT post_id, created_at, type
+		FROM newsfeed_index
+		WHERE bucket = ? AND triggered_by = ?
 		ALLOW FILTERING`
 
 	type indexRow struct {
@@ -1052,17 +1099,47 @@ func RemoveFeedOnUnfriend(ctx context.Context, actorID string, authorID string, 
 	}
 
 	var doomed []indexRow
+	// The two passes can name the same row (a post they wrote AND commented
+	// on). Deleting one twice is harmless in Cassandra, but it inflates the
+	// batch and the reported count, so rows are deduped on their full
+	// clustering key.
+	seen := make(map[string]struct{})
 
-	iter := session.Query(selectCQL, actorID, authorID, rowType).WithContext(ctx).Iter()
+	collect := func(iter *gocql.Iter, dropFanout bool) error {
+		var postID string
+		var createdAt time.Time
+		var rowKind string
 
-	var postID string
-	var createdAt time.Time
-	for iter.Scan(&postID, &createdAt) {
-		doomed = append(doomed, indexRow{postID: postID, createdAt: createdAt})
+		scan := func() bool {
+			if dropFanout {
+				return iter.Scan(&postID, &createdAt, &rowKind)
+			}
+			return iter.Scan(&postID, &createdAt)
+		}
+
+		for scan() {
+			if dropFanout && rowKind == DefaultFanoutType {
+				continue
+			}
+			key := postID + "|" + createdAt.String()
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			doomed = append(doomed, indexRow{postID: postID, createdAt: createdAt})
+		}
+		return iter.Close()
 	}
 
-	if err := iter.Close(); err != nil {
+	authored := session.Query(byAuthorCQL, actorID, authorID, rowType).WithContext(ctx).Iter()
+	if err := collect(authored, false); err != nil {
 		log.Printf("remove_feed_on_unfriend: failed to scan bucket %s for author %s: %v\n", actorID, authorID, err)
+		return
+	}
+
+	triggered := session.Query(byTriggerCQL, actorID, authorID).WithContext(ctx).Iter()
+	if err := collect(triggered, true); err != nil {
+		log.Printf("remove_feed_on_unfriend: failed to scan bucket %s for trigger %s: %v\n", actorID, authorID, err)
 		return
 	}
 
@@ -1093,7 +1170,7 @@ func RemoveFeedOnUnfriend(ctx context.Context, actorID string, authorID string, 
 		removed += end - start
 	}
 
-	log.Printf("remove_feed_on_unfriend: Removed %d rows authored by %s from %s's timeline (type=%s).\n",
+	log.Printf("remove_feed_on_unfriend: Removed %d rows authored or triggered by %s from %s's timeline (type=%s).\n",
 		removed, authorID, actorID, rowType)
 }
 
