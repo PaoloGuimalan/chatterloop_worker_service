@@ -47,6 +47,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", endpoints.HealthCheckHandler)
 	mux.HandleFunc("/status", endpoints.StatusHandler)
+	mux.HandleFunc("/version", endpoints.VersionHandler)
 
 	server := &http.Server{
 		Addr:    ":8880",
