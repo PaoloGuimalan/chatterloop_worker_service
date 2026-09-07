@@ -20,7 +20,10 @@ FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/worker /app/worker
 
-COPY secure-connect-chatterloop.zip /app/secure-connect-chatterloop.zip
+# The Astra secure-connect bundle is NOT baked in. It arrives at runtime as the
+# external swarm secret `astra_bundle`, mounted at the path CASSANDRA_DB_BUNDLE
+# points to. Copying it here would both break CI (the file is gitignored, so a
+# fresh clone lacks it) and publish database credentials inside the image.
 
 EXPOSE 8880
 USER nonroot:nonroot
