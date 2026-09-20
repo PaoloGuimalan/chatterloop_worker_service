@@ -79,6 +79,7 @@ type commandRow struct {
 	Category       string
 	Responds       string
 	WebhookURL     string
+	WebhookMethod  string
 	WebhookRequest map[string]map[string]any
 	BotID          string
 	BotEntityID    string
@@ -711,6 +712,17 @@ func clipAnswer(answer string) string {
 	return answer
 }
 
+// bodylessMethods carry the envelope in the query string instead.
+//
+// Go will happily attach a body to a GET, and a fair number of servers,
+// proxies and CDNs will quietly drop it - so a GET webhook that sent its
+// envelope in a body would work in testing and lose the invoker in
+// production, which is the worst way for this to fail.
+var bodylessMethods = map[string]bool{
+	http.MethodGet:    true,
+	http.MethodDelete: true,
+}
+
 // buildWebhookRequest assembles the outbound call from the stored definition.
 //
 // Four optional parts, all from the row and NONE from the invoker:
@@ -720,56 +732,142 @@ func clipAnswer(answer string) string {
 //	headers  added to the request
 //	payload  merged into the body ALONGSIDE the envelope
 //
-// The envelope wins on a key collision. A definition able to overwrite
-// `invoker` would be a way to make a request claim it came from somebody else,
-// which is exactly what deriving the envelope server-side prevents.
+// THE VERB DECIDES WHERE THE ENVELOPE GOES
+//
+// POST, PUT and PATCH carry it as JSON in the body, beside `payload`. GET and
+// DELETE have no body, so it goes into the query string as dotted keys -
+// `conversation.id`, `invoker.handle` - and `payload` is not sent at all,
+// because a definition that quietly moved into the query string would mean
+// the same row means two different things depending on its verb.
+//
+// The envelope wins on a key collision either way. A definition able to
+// overwrite `invoker` would be a way to make a request claim it came from
+// somebody else, which is exactly what deriving the envelope server-side
+// prevents - so it is written after the stored parts, in both encodings.
 //
 // A user-supplied value must never reach `params`: the caller would then
 // choose the host, and the host is the whole security boundary of an outbound
 // call.
 func buildWebhookRequest(row commandRow, envelope json.RawMessage) (*http.Request, error) {
+	method := webhookMethod(row)
 	target := applyParams(row.WebhookURL, row.WebhookRequest["params"])
 
 	parsed, err := url.Parse(target)
 	if err != nil {
 		return nil, fmt.Errorf("bad webhook url: %w", err)
 	}
-	query := parsed.Query()
-	for key, value := range row.WebhookRequest["query"] {
-		query.Set(key, fmt.Sprint(value))
-	}
-	parsed.RawQuery = query.Encode()
 
-	body := map[string]any{}
-	for key, value := range row.WebhookRequest["payload"] {
-		body[key] = value
-	}
-	// Decoded and re-encoded so the envelope's keys sit beside the payload's
-	// at the top level, and so the envelope overwrites rather than nests.
 	var envelopeFields map[string]any
 	if len(envelope) > 0 {
 		if err := json.Unmarshal(envelope, &envelopeFields); err != nil {
 			return nil, fmt.Errorf("bad envelope: %w", err)
 		}
 	}
-	for key, value := range envelopeFields {
-		body[key] = value
+
+	query := parsed.Query()
+	for key, value := range row.WebhookRequest["query"] {
+		query.Set(key, fmt.Sprint(value))
 	}
 
-	encoded, err := json.Marshal(body)
+	var reader io.Reader
+	var encoded []byte
+
+	if bodylessMethods[method] {
+		// After the stored query, so the envelope still wins.
+		flattenQuery("", envelopeFields, query)
+	} else {
+		body := map[string]any{}
+		for key, value := range row.WebhookRequest["payload"] {
+			body[key] = value
+		}
+		// Decoded and re-encoded so the envelope's keys sit beside the
+		// payload's at the top level, and so the envelope overwrites rather
+		// than nests.
+		for key, value := range envelopeFields {
+			body[key] = value
+		}
+		if encoded, err = json.Marshal(body); err != nil {
+			return nil, err
+		}
+		reader = bytes.NewReader(encoded)
+	}
+
+	parsed.RawQuery = query.Encode()
+
+	request, err := http.NewRequest(method, parsed.String(), reader)
 	if err != nil {
 		return nil, err
 	}
-
-	request, err := http.NewRequest(http.MethodPost, parsed.String(), bytes.NewReader(encoded))
-	if err != nil {
-		return nil, err
+	if encoded != nil {
+		request.Header.Set("Content-Type", "application/json")
 	}
-	request.Header.Set("Content-Type", "application/json")
+	// Last, so a stored header can override the Content-Type this set - some
+	// endpoints want a vendor type - while nothing a definition sets can
+	// change the verb or the envelope.
 	for key, value := range row.WebhookRequest["headers"] {
 		request.Header.Set(key, fmt.Sprint(value))
 	}
 	return request, nil
+}
+
+// webhookMethod is the row's verb, upper-cased, falling back to POST.
+//
+// The column is NULL for every command that makes no request, and may be NULL
+// on a webhook row too - a caller that does not care about the verb does not
+// have to name one. The query COALESCEs it to an empty string, which lands
+// here alongside the other reasons a verb might not be readable: a row
+// written before the column existed, or one carrying a value this build does
+// not know. All of them mean POST, which is what every webhook command did
+// before the column existed - so an unreadable verb behaves like the old code
+// rather than failing.
+func webhookMethod(row commandRow) string {
+	switch strings.ToUpper(strings.TrimSpace(row.WebhookMethod)) {
+	case http.MethodGet:
+		return http.MethodGet
+	case http.MethodPut:
+		return http.MethodPut
+	case http.MethodPatch:
+		return http.MethodPatch
+	case http.MethodDelete:
+		return http.MethodDelete
+	default:
+		return http.MethodPost
+	}
+}
+
+// flattenQuery writes a decoded envelope into a query string as dotted keys.
+//
+// `{"conversation":{"id":"c-1"}}` becomes `conversation.id=c-1`. The same
+// spelling the JSON body uses, so a receiver reading one and then the other
+// is reading the same names.
+//
+// Objects recurse; everything else is written with fmt, which keeps a string
+// as itself and gives a number, a bool or a null a readable spelling. An
+// array is written as JSON rather than as repeated keys - a receiver can
+// decode that, where `tags=a&tags=b` versus `tags[]=a` is a convention nobody
+// agrees on.
+func flattenQuery(prefix string, fields map[string]any, query url.Values) {
+	for key, value := range fields {
+		path := key
+		if prefix != "" {
+			path = prefix + "." + key
+		}
+
+		switch typed := value.(type) {
+		case map[string]any:
+			flattenQuery(path, typed, query)
+		case nil:
+			// Written, not skipped: `replying_to=` says the field exists and
+			// is empty, where its absence would say the sender is old.
+			query.Set(path, "")
+		case []any:
+			if encoded, err := json.Marshal(typed); err == nil {
+				query.Set(path, string(encoded))
+			}
+		default:
+			query.Set(path, fmt.Sprint(typed))
+		}
+	}
 }
 
 // applyParams fills {placeholders} from the stored definition.
@@ -793,7 +891,7 @@ func applyParams(raw string, params map[string]any) string {
 func loadCommand(ctx context.Context, id string) (commandRow, error) {
 	const query = `
 		SELECT c.id, c.name, c.category, c.responds,
-		       c.webhook_url, c.webhook_request,
+		       c.webhook_url, COALESCE(c.webhook_method, ''), c.webhook_request,
 		       b.id, b.entity_id, b.handle, b.is_system
 		  FROM bot_commands c
 		  JOIN bot_bot b ON b.id = c.bot_id
@@ -804,7 +902,7 @@ func loadCommand(ctx context.Context, id string) (commandRow, error) {
 
 	err := connections.Pool().QueryRow(ctx, query, id).Scan(
 		&row.ID, &row.Name, &row.Category, &row.Responds,
-		&row.WebhookURL, &request,
+		&row.WebhookURL, &row.WebhookMethod, &request,
 		&row.BotID, &row.BotEntityID, &row.BotHandle, &row.BotIsSystem,
 	)
 	if err != nil {

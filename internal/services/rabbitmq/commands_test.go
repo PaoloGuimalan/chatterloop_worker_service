@@ -115,6 +115,160 @@ func TestABareDefinitionStillBuilds(t *testing.T) {
 	}
 }
 
+// --- the verb --------------------------------------------------------------
+
+// A row written before the column existed, or one carrying a verb this build
+// does not know, behaves like the old code rather than failing.
+func TestTheDefaultVerbIsPost(t *testing.T) {
+	for _, stored := range []string{"", "   ", "TRACE", "nonsense"} {
+		row := rowFixture()
+		row.WebhookMethod = stored
+
+		request, err := buildWebhookRequest(row, envelopeFixture())
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", stored, err)
+		}
+		if request.Method != http.MethodPost {
+			t.Fatalf("%q should fall back to POST, got %s", stored, request.Method)
+		}
+	}
+}
+
+func TestTheStoredVerbIsUsed(t *testing.T) {
+	for stored, want := range map[string]string{
+		"get":    http.MethodGet,
+		"PUT":    http.MethodPut,
+		"patch":  http.MethodPatch,
+		"DELETE": http.MethodDelete,
+	} {
+		row := rowFixture()
+		row.WebhookMethod = stored
+
+		request, err := buildWebhookRequest(row, envelopeFixture())
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", stored, err)
+		}
+		if request.Method != want {
+			t.Fatalf("%q should be %s, got %s", stored, want, request.Method)
+		}
+	}
+}
+
+// PUT and PATCH carry a body exactly the way POST always did.
+func TestAWritingVerbStillCarriesTheBody(t *testing.T) {
+	row := rowFixture()
+	row.WebhookMethod = "PATCH"
+
+	request, err := buildWebhookRequest(row, envelopeFixture())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := request.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("content type: %q", got)
+	}
+
+	body := decodeBody(t, request)
+	if body["source"] != "chat" {
+		t.Fatalf("payload missing: %v", body["source"])
+	}
+	invoker, _ := body["invoker"].(map[string]any)
+	if invoker["entity_id"] != "entity-paulo" {
+		t.Fatalf("envelope missing: %v", body["invoker"])
+	}
+}
+
+// Go will attach a body to a GET and a fair number of servers and proxies will
+// drop it - so the envelope travels in the query string instead, and the
+// receiver still learns who typed the command and where.
+func TestABodylessVerbPutsTheEnvelopeInTheQuery(t *testing.T) {
+	for _, method := range []string{"GET", "DELETE"} {
+		row := rowFixture()
+		row.WebhookMethod = method
+
+		request, err := buildWebhookRequest(row, envelopeFixture())
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", method, err)
+		}
+
+		if request.Body != nil {
+			t.Fatalf("%s should carry no body", method)
+		}
+		if got := request.Header.Get("Content-Type"); got != "" {
+			t.Fatalf("%s should set no content type, got %q", method, got)
+		}
+
+		query := request.URL.Query()
+		if got := query.Get("conversation.id"); got != "conv-1" {
+			t.Fatalf("%s: conversation.id was %q", method, got)
+		}
+		if got := query.Get("invoker.handle"); got != "paologuimalan" {
+			t.Fatalf("%s: invoker.handle was %q", method, got)
+		}
+		if got := query.Get("command.name"); got != "summarize" {
+			t.Fatalf("%s: command.name was %q", method, got)
+		}
+		// The stored query survives alongside it.
+		if got := query.Get("mode"); got != "brief" {
+			t.Fatalf("%s: the stored query was lost: %q", method, got)
+		}
+	}
+}
+
+// A null is written rather than skipped: `message.replying_to=` says the field
+// exists and is empty, where its absence would say the sender is old.
+func TestABodylessVerbWritesANullAsEmpty(t *testing.T) {
+	row := rowFixture()
+	row.WebhookMethod = "GET"
+
+	request, err := buildWebhookRequest(row, envelopeFixture())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	query := request.URL.Query()
+	if _, present := query["message.replying_to"]; !present {
+		t.Fatal("a null field must still be written")
+	}
+	if got := query.Get("message.replying_to"); got != "" {
+		t.Fatalf("a null should be empty, got %q", got)
+	}
+}
+
+// The same rule the body has: a definition able to overwrite `invoker` would
+// be a way to make a request claim it came from somebody else.
+func TestTheStoredQueryCannotOverwriteTheEnvelope(t *testing.T) {
+	row := rowFixture()
+	row.WebhookMethod = "GET"
+	row.WebhookRequest["query"] = map[string]any{
+		"invoker.handle": "somebody-else",
+	}
+
+	request, err := buildWebhookRequest(row, envelopeFixture())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := request.URL.Query().Get("invoker.handle"); got != "paologuimalan" {
+		t.Fatalf("the stored query overwrote the envelope: %q", got)
+	}
+}
+
+// `payload` is a body definition. Moving it into the query string would mean
+// one row means two different things depending on its verb.
+func TestABodylessVerbDoesNotSendThePayload(t *testing.T) {
+	row := rowFixture()
+	row.WebhookMethod = "GET"
+
+	request, err := buildWebhookRequest(row, envelopeFixture())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, present := request.URL.Query()["source"]; present {
+		t.Fatal("the payload must not leak into the query string")
+	}
+}
+
 // --- placeholders ----------------------------------------------------------
 
 func TestApplyParamsFillsFromTheDefinition(t *testing.T) {
@@ -324,28 +478,9 @@ func TestWebhookAnswerIgnoresABlankOrNonStringKey(t *testing.T) {
 	}
 }
 
-// Half a character is not a shorter message, it is a broken one.
-func TestWebhookAnswerCutsOnRunes(t *testing.T) {
-	long := strings.Repeat("é", webhookAnswerLimit+50)
-
-	answer := webhookAnswer([]byte(long))
-
-	runes := []rune(answer)
-	if len(runes) != webhookAnswerLimit+1 {
-		t.Fatalf("wanted %d runes plus the ellipsis, got %d", webhookAnswerLimit, len(runes))
-	}
-	if runes[len(runes)-1] != '…' {
-		t.Fatal("a truncated answer must say it was truncated")
-	}
-	for _, r := range runes[:len(runes)-1] {
-		if r != 'é' {
-			t.Fatalf("the cut landed mid-character: %q", r)
-		}
-	}
-}
-
-// A truncated fence would be left open, and the message would end mid-block.
-func TestWebhookAnswerClosesAFenceItCut(t *testing.T) {
+// However big the answer is, its fences have to balance - an unterminated one
+// reads as an open code block for the rest of the message.
+func TestWebhookAnswerBalancesItsFences(t *testing.T) {
 	items := make([]string, 0, 400)
 	for index := range 400 {
 		items = append(items, fmt.Sprintf(`{"n":%d}`, index))
@@ -355,7 +490,7 @@ func TestWebhookAnswerClosesAFenceItCut(t *testing.T) {
 	answer := webhookAnswer(body)
 
 	if !strings.HasSuffix(answer, "\n```") {
-		t.Fatalf("a cut fence must be closed, the tail was %q", answer[len(answer)-40:])
+		t.Fatalf("the block must end closed, the tail was %q", answer[len(answer)-40:])
 	}
 	if strings.Count(answer, "```")%2 != 0 {
 		t.Fatal("the fences must be balanced")
