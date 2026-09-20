@@ -37,6 +37,35 @@ import (
 // log line, rather than as a message that silently exceeded its deadline.
 const commandTimeout = 20 * time.Second
 
+// Who answers, from bot_commands.responds. Defined as CommandResponder in
+// user_service/bot/models.py.
+//
+// worker_service runs the `system` and `webhook` categories, and running them
+// IS the platform running them - it holds no bot's token and cannot speak as
+// one. So of the three values, the two that mean something here are `none`
+// (say nothing) and `system` (say it as the System bot). A `bot` command is
+// never queued at all, which is why its responder is the bot's own business.
+const (
+	respondsNone   = "none"
+	respondsSystem = "system"
+)
+
+// webhookBodyLimit bounds what is read back from a webhook.
+//
+// The body is read even when nothing will be done with it, because it has to
+// be drained for the connection to go back to the pool - so the limit is what
+// stops an endpoint answering with a gigabyte from being read into memory by
+// a command anybody in a conversation can type.
+const webhookBodyLimit = 64 * 1024
+
+// webhookAnswerLimit bounds what is POSTED, in runes.
+//
+// A message is read by people rather than parsed by anything, and an endpoint
+// that answers with a page of JSON should not be able to put a page of JSON
+// into somebody's conversation. Deliberately well under the body limit: the
+// difference is room for an answer to be extracted out of a larger response.
+const webhookAnswerLimit = 1500
+
 // RunCommandPayload is what Node publishes to `run_command`.
 type RunCommandPayload struct {
 	CommandID string          `json:"command_id"`
@@ -162,29 +191,72 @@ func runSystemCommand(ctx context.Context, row commandRow, envelope json.RawMess
 	// state, and posting "stopped" into the thread somebody just asked to
 	// quieten is exactly wrong. A built-in that returns text anyway is a
 	// mis-configured row rather than a reason to override the setting.
-	if row.Responds == "none" || answer == "" {
+	//
+	// An empty answer is the same outcome by a different route: a built-in
+	// that had nothing to report said so by returning nothing.
+	if row.Responds == respondsNone || answer == "" {
 		return
 	}
 
-	// Always as System, whichever bot owns the row. worker_service holds no
+	// Anything else is posted as System, whichever bot owns the row and
+	// whichever of the two responders the row names. worker_service holds no
 	// bot's token and cannot speak as one; what it can do is speak as the
 	// platform, which is what a built-in answer is.
-	var parsed commandEnvelope
-	if err := json.Unmarshal(envelope, &parsed); err != nil {
+	conversationID, err := conversationOf(envelope)
+	if err != nil {
 		slog.Error("could not read the envelope", "command", row.Name, "error", err)
 		return
 	}
 
-	if err := PostSystemReply(ctx, parsed.Conversation.ID, answer); err != nil {
+	if err := PostSystemReply(ctx, conversationID, answer); err != nil {
 		slog.Error("could not post the reply",
-			"command", row.Name, "conversation_id", parsed.Conversation.ID, "error", err)
+			"command", row.Name, "conversation_id", conversationID, "error", err)
 	}
 }
 
+// conversationOf pulls the conversation id out of the envelope.
+//
+// Both runners need it and neither can do anything useful without it, so the
+// decode lives in one place rather than being repeated with two slightly
+// different error messages.
+func conversationOf(envelope json.RawMessage) (string, error) {
+	var parsed commandEnvelope
+	if err := json.Unmarshal(envelope, &parsed); err != nil {
+		return "", err
+	}
+	if parsed.Conversation.ID == "" {
+		return "", fmt.Errorf("the envelope names no conversation")
+	}
+	return parsed.Conversation.ID, nil
+}
+
+// runWebhookCommand calls the endpoint, and - if the row asks for it - puts
+// what came back into the conversation.
+//
+// THE TWO SHAPES OF WEBHOOK COMMAND
+//
+//	responds=system  a question. What the endpoint answered is posted as
+//	                 System, because worker_service cannot speak as the bot
+//	                 that owns the row - and the answer is not a bot's anyway,
+//	                 it is somebody's API's.
+//	anything else    a trigger. The call IS the command; deploy something,
+//	                 flip a flag, page somebody. Nothing is posted, and the
+//	                 response is drained and forgotten. This is what every
+//	                 webhook command did before `system` was honoured here, so
+//	                 an existing row keeps behaving exactly as it did.
+//
+// A receiver that would rather answer in its own name needs neither: it holds
+// a token and can send a message like anything else, which is a thing it does
+// on its own account rather than as this command answering.
 func runWebhookCommand(ctx context.Context, row commandRow, envelope json.RawMessage) {
+	// Read once, used by every branch below, so the failure paths and the
+	// success path cannot drift about whether an answer was wanted.
+	wantsAnswer := row.Responds == respondsSystem
+
 	request, err := buildWebhookRequest(row, envelope)
 	if err != nil {
 		slog.Error("could not build webhook request", "command", row.Name, "error", err)
+		reportWebhookFailure(ctx, row, envelope, wantsAnswer, 0)
 		return
 	}
 
@@ -195,21 +267,447 @@ func runWebhookCommand(ctx context.Context, row commandRow, envelope json.RawMes
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		slog.Error("webhook command failed", "command", row.Name, "error", err)
+		reportWebhookFailure(ctx, row, envelope, wantsAnswer, 0)
 		return
 	}
 	defer response.Body.Close()
 
-	// Drained and discarded: the receiver answers in the conversation, not
-	// here, and an unread body holds the connection out of the pool.
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	// Read up to the limit whether or not it will be used, then drain the
+	// rest: an unread body holds the connection out of the pool.
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, webhookBodyLimit))
+	_, _ = io.Copy(io.Discard, response.Body)
 
 	if response.StatusCode >= 400 {
 		slog.Error("webhook command rejected",
 			"command", row.Name, "status", response.StatusCode, "url", row.WebhookURL)
+		reportWebhookFailure(ctx, row, envelope, wantsAnswer, response.StatusCode)
 		return
 	}
 	slog.Info("webhook command delivered",
 		"command", row.Name, "bot", row.BotHandle, "status", response.StatusCode)
+
+	if !wantsAnswer {
+		return
+	}
+	if readErr != nil {
+		slog.Error("could not read the webhook's answer", "command", row.Name, "error", readErr)
+		reportWebhookFailure(ctx, row, envelope, wantsAnswer, response.StatusCode)
+		return
+	}
+
+	answer := webhookAnswer(body)
+	if answer == "" {
+		// A 204, or an endpoint that succeeded and had nothing to say. The
+		// same rule a built-in follows: an empty answer is an answer, and
+		// "(no response)" in a conversation is noise.
+		slog.Info("the webhook answered with nothing to post", "command", row.Name)
+		return
+	}
+
+	conversationID, err := conversationOf(envelope)
+	if err != nil {
+		slog.Error("could not read the envelope", "command", row.Name, "error", err)
+		return
+	}
+	if err := PostSystemReply(ctx, conversationID, answer); err != nil {
+		slog.Error("could not post the webhook's answer",
+			"command", row.Name, "conversation_id", conversationID, "error", err)
+	}
+}
+
+// reportWebhookFailure says, once and briefly, that a command promising an
+// answer has none.
+//
+// ONLY FOR responds=system. A trigger that fails is a log line: nobody in the
+// conversation was waiting to be told anything, and a room does not want to
+// hear about somebody's 502. A command that promised an answer is different -
+// silence there is indistinguishable from a typo, which is the same reason
+// /help answers "not available here" rather than nothing.
+//
+// The status is named and the URL is not. Whoever wired the command knows
+// which endpoint it is; everyone else in the conversation does not need to
+// learn that it exists.
+func reportWebhookFailure(ctx context.Context, row commandRow, envelope json.RawMessage, wantsAnswer bool, statusCode int) {
+	if !wantsAnswer {
+		return
+	}
+
+	conversationID, err := conversationOf(envelope)
+	if err != nil {
+		return
+	}
+
+	text := fmt.Sprintf("/%s could not be completed.", row.Name)
+	if statusCode > 0 {
+		text = fmt.Sprintf("/%s could not be completed (%d).", row.Name, statusCode)
+	}
+
+	// A context that may already be cancelled - the timeout above fires on
+	// exactly the failure worth reporting - so the notice gets its own.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commandTimeout)
+	defer cancel()
+
+	if err := PostSystemReply(ctx, conversationID, text); err != nil {
+		slog.Error("could not post the webhook failure",
+			"command", row.Name, "conversation_id", conversationID, "error", err)
+	}
+}
+
+// webhookAnswer turns a response body into something worth reading.
+//
+// WHY THE FORMATTING IS DONE HERE
+//
+// A raw body is what a program sends a program. `{"handle":"neon",
+// "is_online":true,"since":"2026-09-20T10:04:00Z"}` on one line in a
+// conversation is technically the answer and practically unreadable - and the
+// place to fix that is here, not in two clients. Both of them already render
+// a message as Markdown, with the same grammar on both sides (fenced code,
+// bullets, `**bold**`, tables), so this produces Markdown and neither client
+// needs to know that webhooks exist.
+//
+// WHAT COMES OUT
+//
+//	a human field    posted as prose, because the endpoint already wrote a
+//	                 sentence for a person
+//	a flat object    a bullet per field, `**key**: value`
+//	anything nested  pretty-printed inside a ```json fence: exact, monospace,
+//	                 horizontally scrollable, and impossible to mangle
+//
+// The fence is the fallback ON PURPOSE. A nested object rendered as prose
+// would mean guessing which of somebody's fields matter and how deep to go,
+// and a guess that drops a field is worse than a block that shows all of them.
+func webhookAnswer(body []byte) string {
+	raw := strings.TrimSpace(string(body))
+	if raw == "" {
+		return ""
+	}
+	return clipAnswer(formatWebhookBody(raw))
+}
+
+// answerKeys are the fields tried, in order, when a JSON object is searched
+// for a line meant for a person. The first non-empty string wins.
+//
+// `text` and `message` lead because they are what a response envelope calls
+// its human-readable line - Neon's own bot control endpoint answers
+// `{"status":true,"data":{...},"message":"@neon is now awake."}`, and that
+// sentence is the whole answer.
+//
+// Top level only. A nested match would mean guessing which of several strings
+// deep in somebody's payload was written for a reader.
+var answerKeys = []string{"text", "message", "content", "answer"}
+
+func formatWebhookBody(raw string) string {
+	if fields, ok := topLevelFields(raw); ok {
+		if line := humanLine(fields); line != "" {
+			return line
+		}
+		if list, ok := fieldList(fields); ok {
+			return list
+		}
+		return jsonFence(raw)
+	}
+
+	if items, ok := topLevelItems(raw); ok {
+		if list, ok := itemList(items); ok {
+			return list
+		}
+		return jsonFence(raw)
+	}
+
+	// A bare JSON scalar: `42`, `true`, or a quoted sentence. Unquoted, it is
+	// already the answer.
+	if text, ok := jsonScalar(raw); ok {
+		return text
+	}
+
+	// Not JSON. Prose is posted as written - it is already what somebody meant
+	// to say, and Markdown in it renders the way Markdown in any message does.
+	//
+	// A body opening with a tag is the exception: an endpoint answering with a
+	// page rather than a result. Fenced, so it reads as raw output instead of
+	// as a wall of angle brackets somebody has to squint at.
+	if strings.HasPrefix(raw, "<") && !strings.Contains(raw, "```") {
+		return "```\n" + raw + "\n```"
+	}
+	return raw
+}
+
+// jsonField is one top-level key and its value, IN THE ORDER THE RESPONSE
+// WROTE THEM.
+//
+// Decoding into a map would lose that, and Go randomises map iteration - so
+// the same webhook would list its fields in a different order every time it
+// ran, which looks like the answer changing when nothing has.
+type jsonField struct {
+	Key   string
+	Value json.RawMessage
+}
+
+// topLevelFields walks a JSON object one token at a time, keeping each value
+// undecoded. Order survives, and so does the exact text of every number -
+// decoding into `any` turns 1200 into a float64 and prints it as 1200 or
+// 1.2e+03 depending on its size, which is not what the endpoint said.
+func topLevelFields(raw string) ([]jsonField, bool) {
+	if !strings.HasPrefix(raw, "{") {
+		return nil, false
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return nil, false
+	}
+
+	var fields []jsonField
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, ok := token.(string)
+		if !ok {
+			return nil, false
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false
+		}
+		fields = append(fields, jsonField{Key: key, Value: value})
+	}
+
+	// The closing brace, and then nothing: a body with a second document after
+	// it is not an object, whatever its first character says.
+	if _, err := decoder.Token(); err != nil {
+		return nil, false
+	}
+	if decoder.More() {
+		return nil, false
+	}
+	return fields, true
+}
+
+// topLevelItems needs no token walk - a slice is ordered already.
+func topLevelItems(raw string) ([]json.RawMessage, bool) {
+	if !strings.HasPrefix(raw, "[") {
+		return nil, false
+	}
+	var items []json.RawMessage
+	if json.Unmarshal([]byte(raw), &items) != nil {
+		return nil, false
+	}
+	return items, true
+}
+
+func humanLine(fields []jsonField) string {
+	for _, key := range answerKeys {
+		for _, field := range fields {
+			if field.Key != key {
+				continue
+			}
+			// A STRING, specifically. `{"message": 42}` is a field that
+			// happens to share a name with a sentence, and posting "42" as
+			// the whole answer would drop every other field to say it.
+			if !strings.HasPrefix(strings.TrimSpace(string(field.Value)), `"`) {
+				continue
+			}
+			if text, ok := scalarText(field.Value); ok {
+				if trimmed := strings.TrimSpace(text); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// maxListedFields is where a bullet list stops being easier to read than the
+// block it replaces. Past this, the fence is the kinder answer.
+const maxListedFields = 12
+
+// maxInlineValue is how long a single value may be before the whole object
+// goes in the fence - a paragraph hanging off a bullet is not a list.
+const maxInlineValue = 160
+
+// fieldList renders a FLAT object as one bullet per field.
+//
+// ALL OR NOTHING. One nested value, one key that would be read as markup, one
+// value too long - and the whole object goes to the fence instead. A list
+// where some fields are prose and others are raw JSON is harder to read than
+// either, and mixing them would also mean deciding which of the two a reader
+// should trust.
+//
+// Nesting is the fence's job and not this function's. Flattening it into
+// dotted paths was tried and undone: `data.uptime.days` reads as a field name
+// that does not exist, and both clients parse lists flat - an indented line is
+// a continuation of the item above it, never a child - so there is no shape a
+// list can show here that the block does not show better.
+func fieldList(fields []jsonField) (string, bool) {
+	if len(fields) == 0 || len(fields) > maxListedFields {
+		return "", false
+	}
+
+	lines := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if !plainKey(field.Key) {
+			return "", false
+		}
+		text, ok := scalarText(field.Value)
+		if !ok {
+			return "", false
+		}
+		value, ok := inlineValue(text)
+		if !ok {
+			return "", false
+		}
+		lines = append(lines, "- **"+field.Key+"**: "+value)
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+// itemList renders an array of scalars as a plain bullet list.
+func itemList(items []json.RawMessage) (string, bool) {
+	if len(items) == 0 || len(items) > maxListedFields {
+		return "", false
+	}
+
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		text, ok := scalarText(item)
+		if !ok {
+			return "", false
+		}
+		value, ok := inlineValue(text)
+		if !ok {
+			return "", false
+		}
+		lines = append(lines, "- "+value)
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+// scalarText is a value's text, or false if it is an object or an array.
+//
+// A string comes back unquoted; everything else comes back exactly as the
+// endpoint wrote it, which is the point of holding it as RawMessage.
+func scalarText(value json.RawMessage) (string, bool) {
+	trimmed := strings.TrimSpace(string(value))
+	if trimmed == "" {
+		return "", false
+	}
+	switch trimmed[0] {
+	case '{', '[':
+		return "", false
+	case '"':
+		var text string
+		if json.Unmarshal(value, &text) != nil {
+			return "", false
+		}
+		return text, true
+	default:
+		return trimmed, true
+	}
+}
+
+// jsonScalar is the same thing for a body that is nothing BUT a scalar.
+func jsonScalar(raw string) (string, bool) {
+	if strings.HasPrefix(raw, "{") || strings.HasPrefix(raw, "[") {
+		return "", false
+	}
+	var decoded any
+	if json.Unmarshal([]byte(raw), &decoded) != nil {
+		return "", false
+	}
+	if text, ok := decoded.(string); ok {
+		return text, true
+	}
+	return raw, true
+}
+
+// plainKey says whether a key can be bolded without being read as markup.
+//
+// `**is_online**` is safe - both clients require emphasis delimiters to hug
+// non-whitespace AND sit on a word boundary, so a single underscore inside a
+// word never opens an italic. A doubled one would, and `*` inside the key
+// would close the bold early, so both are refused and the object goes in the
+// fence rather than rendering somebody's field name in italics.
+func plainKey(key string) bool {
+	if key == "" || len(key) > 40 || strings.Contains(key, "__") {
+		return false
+	}
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_', r == '-', r == '.', r == ' ':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// inlineValue is a value as it goes on the right of a bullet.
+//
+// Plain text stays plain, so a sentence reads as a sentence and a URL still
+// autolinks. Anything carrying emphasis or link punctuation goes in a code
+// span, where both clients' inline rules leave it alone - a value is data,
+// and data must survive being displayed.
+//
+// A backtick has nowhere safe to go: the inline code rule on both sides is
+// single-backtick only, so there is no delimiter that a backtick cannot close.
+// That value refuses, and the caller falls back to the fence.
+func inlineValue(text string) (string, bool) {
+	if strings.ContainsAny(text, "`\n\r") || len(text) > maxInlineValue {
+		return "", false
+	}
+	if strings.TrimSpace(text) == "" {
+		// Quoted and monospaced rather than left blank: "- **note**: " reads
+		// as a bug, and a value that is genuinely empty - or genuinely three
+		// spaces - should be visible as what it is.
+		return "`\"" + text + "\"`", true
+	}
+	if strings.ContainsAny(text, "*_~[]") {
+		return "`" + text + "`", true
+	}
+	return text, true
+}
+
+// jsonFence is the exact response, pretty-printed, in a ```json block.
+//
+// `json.Indent` reformats the TEXT rather than re-encoding a decoded value, so
+// key order and every number's spelling are the endpoint's own.
+func jsonFence(raw string) string {
+	if strings.Contains(raw, "```") {
+		// A fence inside the body would close ours early and spill the rest
+		// into the message as markup.
+		return raw
+	}
+
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, []byte(raw), "", "  "); err != nil {
+		// It parsed a moment ago, so this should not happen - post what came
+		// back rather than nothing.
+		return raw
+	}
+	return "```json\n" + pretty.String() + "\n```"
+}
+
+// clipAnswer bounds what is posted.
+func clipAnswer(answer string) string {
+	runes := []rune(answer)
+	if len(runes) <= webhookAnswerLimit {
+		return answer
+	}
+
+	// Cut on runes, not bytes: half a character is not a shorter message, it
+	// is a broken one.
+	clipped := strings.TrimSpace(string(runes[:webhookAnswerLimit])) + "…"
+
+	// A cut inside a fence leaves it open. Both clients still render an
+	// unterminated fence as code, so this is about the message looking
+	// finished rather than about it working.
+	if strings.Count(clipped, "```")%2 == 1 {
+		clipped += "\n```"
+	}
+	return clipped
 }
 
 // buildWebhookRequest assembles the outbound call from the stored definition.
