@@ -692,22 +692,23 @@ func jsonFence(raw string) string {
 
 // clipAnswer bounds what is posted.
 func clipAnswer(answer string) string {
-	runes := []rune(answer)
-	if len(runes) <= webhookAnswerLimit {
-		return answer
-	}
+	// runes := []rune(answer)
+	// if len(runes) <= webhookAnswerLimit {
+	// 	return answer
+	// }
 
-	// Cut on runes, not bytes: half a character is not a shorter message, it
-	// is a broken one.
-	clipped := strings.TrimSpace(string(runes[:webhookAnswerLimit])) + "…"
+	// // Cut on runes, not bytes: half a character is not a shorter message, it
+	// // is a broken one.
+	// clipped := strings.TrimSpace(string(runes[:webhookAnswerLimit])) + "…"
 
-	// A cut inside a fence leaves it open. Both clients still render an
-	// unterminated fence as code, so this is about the message looking
-	// finished rather than about it working.
-	if strings.Count(clipped, "```")%2 == 1 {
-		clipped += "\n```"
-	}
-	return clipped
+	// // A cut inside a fence leaves it open. Both clients still render an
+	// // unterminated fence as code, so this is about the message looking
+	// // finished rather than about it working.
+	// if strings.Count(clipped, "```")%2 == 1 {
+	// 	clipped += "\n```"
+	// }
+	// return clipped
+	return answer
 }
 
 // buildWebhookRequest assembles the outbound call from the stored definition.
