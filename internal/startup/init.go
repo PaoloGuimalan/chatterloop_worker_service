@@ -31,6 +31,16 @@ func initialize_connections() {
 		log.Printf("Mongo unavailable, push notifications will be dropped: %v", err)
 	}
 
+	// Optional, unlike every other connection here. Redis carries the realtime
+	// frame a built-in command's answer is announced with; without it the
+	// answer is still stored and still in history, it just does not appear
+	// until the client refreshes. Refusing to boot over that would take
+	// ranking, feeds and push down with it.
+	redisClient := &connections.Redis{}
+	if err := connections.Open(context.Background(), "redis", redisClient); err != nil {
+		log.Printf("Redis unavailable, command replies will not be announced: %v", err)
+	}
+
 	rmq, err := rabbitmq.RabbitClient()
 	if err != nil {
 		log.Fatalf("Initialization failed: %v", err)
@@ -67,6 +77,18 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ) {
 		Timeout: 10 * time.Second,
 		Handler: handle(func(ctx context.Context, p rabbitmq.UpdateRankingPayload) {
 			rabbitmq.UpdateRankingScore(p.PostID, p.UpdateType, p.IsDecrease)
+		}),
+	})
+
+	// A /command typed in a conversation. Node parsed it, resolved which bot
+	// owns it, and published one job per bot; this loads the definition and
+	// runs it. The timeout is above the 20s webhook deadline so a slow
+	// endpoint fails as a webhook error rather than as an expired message.
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "run_command",
+		Timeout: 30 * time.Second,
+		Handler: handle(func(ctx context.Context, p rabbitmq.RunCommandPayload) {
+			rabbitmq.RunCommand(ctx, p)
 		}),
 	})
 

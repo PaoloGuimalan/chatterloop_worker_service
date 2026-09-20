@@ -39,6 +39,8 @@ func Open(ctx context.Context, name string, db Database) error {
 			ActiveCassandra = db
 		case "mongo":
 			ActiveMongo = db
+		case "redis":
+			ActiveRedis = db
 	}
 
 	return nil

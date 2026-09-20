@@ -102,3 +102,15 @@ func Sessions() *mongo.Collection {
 	}
 	return mg.Database.Collection("sessions")
 }
+
+// Collection returns any collection by name, or nil when Mongo is not
+// connected. Named explicitly at each call site for the same reason Sessions
+// is: the physical names are Node's, declared through mongoose, and not
+// something either side should guess at.
+func Collection(name string) *mongo.Collection {
+	mg, ok := ActiveMongo.(*Mongo)
+	if !ok || mg.Database == nil {
+		return nil
+	}
+	return mg.Database.Collection(name)
+}
