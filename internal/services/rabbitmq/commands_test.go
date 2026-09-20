@@ -178,9 +178,9 @@ func TestAWritingVerbStillCarriesTheBody(t *testing.T) {
 }
 
 // Go will attach a body to a GET and a fair number of servers and proxies will
-// drop it - so the envelope travels in the query string instead, and the
-// receiver still learns who typed the command and where.
-func TestABodylessVerbPutsTheEnvelopeInTheQuery(t *testing.T) {
+// drop it - so the envelope travels in a header, and the receiver still learns
+// who typed the command and where.
+func TestABodylessVerbPutsTheEnvelopeInAHeader(t *testing.T) {
 	for _, method := range []string{"GET", "DELETE"} {
 		row := rowFixture()
 		row.WebhookMethod = method
@@ -197,28 +197,34 @@ func TestABodylessVerbPutsTheEnvelopeInTheQuery(t *testing.T) {
 			t.Fatalf("%s should set no content type, got %q", method, got)
 		}
 
-		query := request.URL.Query()
-		if got := query.Get("conversation.id"); got != "conv-1" {
-			t.Fatalf("%s: conversation.id was %q", method, got)
+		var carried map[string]any
+		header := request.Header.Get(envelopeHeader)
+		if err := json.Unmarshal([]byte(header), &carried); err != nil {
+			t.Fatalf("%s: the header is not the envelope: %v", method, err)
 		}
-		if got := query.Get("invoker.handle"); got != "paologuimalan" {
-			t.Fatalf("%s: invoker.handle was %q", method, got)
+		conversation, _ := carried["conversation"].(map[string]any)
+		if conversation["id"] != "conv-1" {
+			t.Fatalf("%s: the envelope lost the conversation: %v", method, carried)
 		}
-		if got := query.Get("command.name"); got != "summarize" {
-			t.Fatalf("%s: command.name was %q", method, got)
-		}
-		// The stored query survives alongside it.
-		if got := query.Get("mode"); got != "brief" {
-			t.Fatalf("%s: the stored query was lost: %q", method, got)
+		invoker, _ := carried["invoker"].(map[string]any)
+		if invoker["handle"] != "paologuimalan" {
+			t.Fatalf("%s: the envelope lost the invoker: %v", method, carried)
 		}
 	}
 }
 
-// A null is written rather than skipped: `message.replying_to=` says the field
-// exists and is empty, where its absence would say the sender is old.
-func TestABodylessVerbWritesANullAsEmpty(t *testing.T) {
+// THE REGRESSION THIS EXISTS FOR.
+//
+// The envelope used to go into the query string, and newsdata.io answers 422
+// "You can't use the conversation.id parameter" to a single added key - so a
+// /top-news that worked when pasted into a browser failed as a command. The
+// query string is the definition's alone.
+func TestABodylessVerbSendsOnlyTheStoredQuery(t *testing.T) {
 	row := rowFixture()
 	row.WebhookMethod = "GET"
+	row.WebhookURL = "https://news.test/latest?apikey=secret"
+	row.WebhookRequest["params"] = nil
+	row.WebhookRequest["query"] = map[string]any{"country": "ph"}
 
 	request, err := buildWebhookRequest(row, envelopeFixture())
 	if err != nil {
@@ -226,35 +232,13 @@ func TestABodylessVerbWritesANullAsEmpty(t *testing.T) {
 	}
 
 	query := request.URL.Query()
-	if _, present := query["message.replying_to"]; !present {
-		t.Fatal("a null field must still be written")
-	}
-	if got := query.Get("message.replying_to"); got != "" {
-		t.Fatalf("a null should be empty, got %q", got)
+	if len(query) != 2 || query.Get("apikey") != "secret" || query.Get("country") != "ph" {
+		t.Fatalf("the query string must carry only what was configured: %v", query)
 	}
 }
 
-// The same rule the body has: a definition able to overwrite `invoker` would
-// be a way to make a request claim it came from somebody else.
-func TestTheStoredQueryCannotOverwriteTheEnvelope(t *testing.T) {
-	row := rowFixture()
-	row.WebhookMethod = "GET"
-	row.WebhookRequest["query"] = map[string]any{
-		"invoker.handle": "somebody-else",
-	}
-
-	request, err := buildWebhookRequest(row, envelopeFixture())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if got := request.URL.Query().Get("invoker.handle"); got != "paologuimalan" {
-		t.Fatalf("the stored query overwrote the envelope: %q", got)
-	}
-}
-
-// `payload` is a body definition. Moving it into the query string would mean
-// one row means two different things depending on its verb.
+// `payload` is a body definition. Sending it anywhere else would mean one row
+// means two different things depending on its verb.
 func TestABodylessVerbDoesNotSendThePayload(t *testing.T) {
 	row := rowFixture()
 	row.WebhookMethod = "GET"
@@ -266,6 +250,103 @@ func TestABodylessVerbDoesNotSendThePayload(t *testing.T) {
 
 	if _, present := request.URL.Query()["source"]; present {
 		t.Fatal("the payload must not leak into the query string")
+	}
+}
+
+// A stored header may override the Content-Type - some endpoints want a
+// vendor type - but must not be able to say who sent the command.
+func TestAStoredHeaderCannotForgeTheEnvelope(t *testing.T) {
+	row := rowFixture()
+	row.WebhookMethod = "GET"
+	row.WebhookRequest["headers"] = map[string]any{
+		envelopeHeader: `{"invoker":{"handle":"somebody-else"}}`,
+	}
+
+	request, err := buildWebhookRequest(row, envelopeFixture())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var carried map[string]any
+	if err := json.Unmarshal([]byte(request.Header.Get(envelopeHeader)), &carried); err != nil {
+		t.Fatalf("the header is not the envelope: %v", err)
+	}
+	invoker, _ := carried["invoker"].(map[string]any)
+	if invoker["handle"] != "paologuimalan" {
+		t.Fatalf("a stored header overwrote the envelope: %v", carried)
+	}
+}
+
+// A newline typed after the command would otherwise be a second header. JSON
+// escapes every control character, so the value is safe by construction - and
+// this proves the transport agrees.
+func TestTheEnvelopeHeaderSurvivesAwkwardText(t *testing.T) {
+	row := rowFixture()
+	row.WebhookMethod = "GET"
+	envelope := json.RawMessage(
+		`{"command":{"name":"summarize","args":"line one\nline two\r\ntabs\there"},` +
+			`"conversation":{"id":"conv-1"},"invoker":{"handle":"ana"}}`)
+
+	request, err := buildWebhookRequest(row, envelope)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	value := request.Header.Get(envelopeHeader)
+	if strings.ContainsAny(value, "\n\r") {
+		t.Fatalf("a raw newline in a header value is a second header: %q", value)
+	}
+
+	var carried map[string]any
+	if err := json.Unmarshal([]byte(value), &carried); err != nil {
+		t.Fatalf("the header is not the envelope: %v", err)
+	}
+	command, _ := carried["command"].(map[string]any)
+	if command["args"] != "line one\nline two\r\ntabs\there" {
+		t.Fatalf("the text did not survive: %q", command["args"])
+	}
+
+	// And the transport accepts it, which is the assertion that actually
+	// matters - Go rejects an invalid header value at write time.
+	if err := request.Header.Write(io.Discard); err != nil {
+		t.Fatalf("the transport refused the header: %v", err)
+	}
+}
+
+// A webhook that fires without context beats one that does not fire because
+// somebody typed an essay.
+func TestAnOversizeEnvelopeIsDroppedNotFatal(t *testing.T) {
+	row := rowFixture()
+	row.WebhookMethod = "GET"
+	envelope := json.RawMessage(
+		`{"command":{"args":"` + strings.Repeat("x", envelopeHeaderLimit+100) + `"}}`)
+
+	request, err := buildWebhookRequest(row, envelope)
+	if err != nil {
+		t.Fatalf("an oversize envelope must not fail the request: %v", err)
+	}
+	if got := request.Header.Get(envelopeHeader); got != "" {
+		t.Fatalf("it should have been dropped, got %d bytes", len(got))
+	}
+	if request.URL.Host != "example.test" {
+		t.Fatalf("the request should still be built: %s", request.URL)
+	}
+}
+
+// A body verb already carries the envelope in the body; sending it twice
+// would be two sources of truth a receiver has to choose between.
+func TestABodyVerbSendsNoEnvelopeHeader(t *testing.T) {
+	for _, method := range []string{"POST", "PUT", "PATCH"} {
+		row := rowFixture()
+		row.WebhookMethod = method
+
+		request, err := buildWebhookRequest(row, envelopeFixture())
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", method, err)
+		}
+		if got := request.Header.Get(envelopeHeader); got != "" {
+			t.Fatalf("%s should not duplicate the envelope in a header: %q", method, got)
+		}
 	}
 }
 

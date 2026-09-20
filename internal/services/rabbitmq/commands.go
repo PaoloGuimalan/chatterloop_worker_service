@@ -712,7 +712,7 @@ func clipAnswer(answer string) string {
 	return answer
 }
 
-// bodylessMethods carry the envelope in the query string instead.
+// bodylessMethods carry the envelope in a header instead.
 //
 // Go will happily attach a body to a GET, and a fair number of servers,
 // proxies and CDNs will quietly drop it - so a GET webhook that sent its
@@ -722,6 +722,34 @@ var bodylessMethods = map[string]bool{
 	http.MethodGet:    true,
 	http.MethodDelete: true,
 }
+
+// envelopeHeader carries the envelope on a verb that has no body.
+//
+// WHY NOT THE QUERY STRING, WHICH IS WHAT THIS DID FIRST
+//
+// Because a webhook command points at somebody else's API, and a strict one
+// rejects every parameter it does not recognise. newsdata.io answers 422
+// "You can't use the conversation.id parameter" to a single added key - so a
+// /top-news that worked when its URL was pasted into a browser failed as a
+// command, for a reason nothing in the conversation could explain.
+//
+// An unknown HEADER is ignored by everything. That asymmetry is the whole
+// argument: a receiver written for chatterloop still learns who typed the
+// command and where, and a receiver that has never heard of chatterloop is
+// not broken by being told.
+//
+// Only on bodyless verbs. POST, PUT and PATCH already carry the envelope in
+// the body, and sending it twice would be two sources of truth that a
+// receiver has to choose between.
+const envelopeHeader = "X-Chatterloop-Envelope"
+
+// envelopeHeaderLimit keeps a long command out of a 431.
+//
+// `command.args` is whatever somebody typed after the command, so it is the
+// one unbounded field in the envelope. Most servers cap a header line around
+// 8KB; past this the header is dropped and the request still goes, because a
+// webhook that fires without context beats one that does not fire.
+const envelopeHeaderLimit = 4096
 
 // buildWebhookRequest assembles the outbound call from the stored definition.
 //
@@ -735,15 +763,22 @@ var bodylessMethods = map[string]bool{
 // THE VERB DECIDES WHERE THE ENVELOPE GOES
 //
 // POST, PUT and PATCH carry it as JSON in the body, beside `payload`. GET and
-// DELETE have no body, so it goes into the query string as dotted keys -
-// `conversation.id`, `invoker.handle` - and `payload` is not sent at all,
-// because a definition that quietly moved into the query string would mean
-// the same row means two different things depending on its verb.
+// DELETE have no body, so it goes in the X-Chatterloop-Envelope header - see
+// that constant for why a header and not the query string.
 //
-// The envelope wins on a key collision either way. A definition able to
+// `payload` is not sent on a bodyless verb. A definition that quietly moved
+// into the query string would mean one row means two different things
+// depending on its verb, and it would put a stored value somewhere the
+// endpoint never agreed to read it from.
+//
+// THE QUERY STRING IS THE DEFINITION'S ALONE. Nothing this service derives
+// goes in it, so a command against a strict API sends exactly the parameters
+// somebody configured and no others.
+//
+// The envelope wins on a collision, in both encodings. A definition able to
 // overwrite `invoker` would be a way to make a request claim it came from
 // somebody else, which is exactly what deriving the envelope server-side
-// prevents - so it is written after the stored parts, in both encodings.
+// prevents - so it is written after the stored parts.
 //
 // A user-supplied value must never reach `params`: the caller would then
 // choose the host, and the host is the whole security boundary of an outbound
@@ -768,14 +803,12 @@ func buildWebhookRequest(row commandRow, envelope json.RawMessage) (*http.Reques
 	for key, value := range row.WebhookRequest["query"] {
 		query.Set(key, fmt.Sprint(value))
 	}
+	parsed.RawQuery = query.Encode()
 
 	var reader io.Reader
 	var encoded []byte
 
-	if bodylessMethods[method] {
-		// After the stored query, so the envelope still wins.
-		flattenQuery("", envelopeFields, query)
-	} else {
+	if !bodylessMethods[method] {
 		body := map[string]any{}
 		for key, value := range row.WebhookRequest["payload"] {
 			body[key] = value
@@ -792,8 +825,6 @@ func buildWebhookRequest(row commandRow, envelope json.RawMessage) (*http.Reques
 		reader = bytes.NewReader(encoded)
 	}
 
-	parsed.RawQuery = query.Encode()
-
 	request, err := http.NewRequest(method, parsed.String(), reader)
 	if err != nil {
 		return nil, err
@@ -801,13 +832,44 @@ func buildWebhookRequest(row commandRow, envelope json.RawMessage) (*http.Reques
 	if encoded != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	// Last, so a stored header can override the Content-Type this set - some
-	// endpoints want a vendor type - while nothing a definition sets can
-	// change the verb or the envelope.
+	// Before the envelope header, so a stored header can override the
+	// Content-Type above - some endpoints want a vendor type - and cannot
+	// touch what this service says about who sent the command.
 	for key, value := range row.WebhookRequest["headers"] {
 		request.Header.Set(key, fmt.Sprint(value))
 	}
+	if bodylessMethods[method] {
+		setEnvelopeHeader(request, row, envelope)
+	}
 	return request, nil
+}
+
+// setEnvelopeHeader attaches the envelope to a request that has no body.
+//
+// The envelope as it arrived, compacted. JSON escapes every control character,
+// so the result is a valid header value by construction - a newline somebody
+// typed after the command comes out as `\n` rather than as a second header.
+func setEnvelopeHeader(request *http.Request, row commandRow, envelope json.RawMessage) {
+	if len(envelope) == 0 {
+		return
+	}
+
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, envelope); err != nil {
+		slog.Warn("could not compact the envelope for the header",
+			"command", row.Name, "error", err)
+		return
+	}
+
+	if compact.Len() > envelopeHeaderLimit {
+		// The request still goes. A webhook that fires without context beats
+		// one that does not fire because somebody typed an essay.
+		slog.Warn("the envelope is too long to send as a header; sending without it",
+			"command", row.Name, "bytes", compact.Len(), "limit", envelopeHeaderLimit)
+		return
+	}
+
+	request.Header.Set(envelopeHeader, compact.String())
 }
 
 // webhookMethod is the row's verb, upper-cased, falling back to POST.
@@ -832,41 +894,6 @@ func webhookMethod(row commandRow) string {
 		return http.MethodDelete
 	default:
 		return http.MethodPost
-	}
-}
-
-// flattenQuery writes a decoded envelope into a query string as dotted keys.
-//
-// `{"conversation":{"id":"c-1"}}` becomes `conversation.id=c-1`. The same
-// spelling the JSON body uses, so a receiver reading one and then the other
-// is reading the same names.
-//
-// Objects recurse; everything else is written with fmt, which keeps a string
-// as itself and gives a number, a bool or a null a readable spelling. An
-// array is written as JSON rather than as repeated keys - a receiver can
-// decode that, where `tags=a&tags=b` versus `tags[]=a` is a convention nobody
-// agrees on.
-func flattenQuery(prefix string, fields map[string]any, query url.Values) {
-	for key, value := range fields {
-		path := key
-		if prefix != "" {
-			path = prefix + "." + key
-		}
-
-		switch typed := value.(type) {
-		case map[string]any:
-			flattenQuery(path, typed, query)
-		case nil:
-			// Written, not skipped: `replying_to=` says the field exists and
-			// is empty, where its absence would say the sender is old.
-			query.Set(path, "")
-		case []any:
-			if encoded, err := json.Marshal(typed); err == nil {
-				query.Set(path, string(encoded))
-			}
-		default:
-			query.Set(path, fmt.Sprint(typed))
-		}
 	}
 }
 
