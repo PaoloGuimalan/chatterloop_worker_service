@@ -121,7 +121,17 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	// connection is a property of the message, not of the worker, and must not
 	// take the process down — the other listeners are still serving their own
 	// queues from the same binary.
-	postRows, err := connections.Pool().Query(ctx, "SELECT * FROM newsfeed_post WHERE post_id = $1", post_id)
+	// Named columns, NOT SELECT *. RowToStructByName fails on any column the
+	// struct lacks, so SELECT * broke every ranking update the moment a
+	// migration added a column (expires_at) ahead of a worker redeploy - and a
+	// struct field with no column breaks it the other way round. Listing the
+	// columns makes deploy order irrelevant.
+	postRows, err := connections.Pool().Query(ctx, `
+		SELECT post_id, entity_id, is_shared, file_type, caption, content_type,
+		       is_tagged, privacy_status, is_sponsored, is_live, is_archived,
+		       on_feed, date_posted, from_system, deleted_at, deleted_by_id
+		FROM newsfeed_post
+		WHERE post_id = $1`, post_id)
 	if err != nil {
 		log.Printf("update_ranking_score: failed to query post %s: %v\n", post_id, err)
 		return
@@ -796,9 +806,61 @@ func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted ti
 	log.Printf("create_post_score_for_new_post: Successfully generated initial score profile for new Post ID: %s. Score: %f\n", postID, rankingScore)
 }
 
+// The post's KIND as newsfeed_index.kind stores it. Mirrors user_service
+// newsfeed.models.PostKind; anything else newsfeed_post.on_feed holds (legacy
+// rows said "true") is a feed post.
+const (
+	PostKindFeed    = "feed"
+	PostKindMoment  = "moment"
+	PostKindThought = "thought"
+)
+
+func normalizePostKind(onFeed string) string {
+	switch onFeed {
+	case PostKindMoment, PostKindThought:
+		return onFeed
+	default:
+		return PostKindFeed
+	}
+}
+
+// postFanoutKind resolves the kind a post fans out as, and whether it is still
+// live (not deleted, not expired).
+//
+// Read here rather than carried in the queue payload: fan-out is published by
+// both Node (new posts) and Django (comment bumps), and the post row is the one
+// place neither can get wrong.
+//
+// Fails OPEN - a lookup error answers (feed, live), which is exactly what
+// fan-out did before kinds existed, so a blip degrades to old behaviour
+// instead of dropping the fan-out.
+func postFanoutKind(ctx context.Context, postID string) (string, bool) {
+	var onFeed string
+	var live bool
+	err := connections.Pool().QueryRow(ctx, `
+		SELECT on_feed,
+		       deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
+		FROM newsfeed_post
+		WHERE post_id = $1`, postID).Scan(&onFeed, &live)
+	if err != nil {
+		log.Printf("bulk_fanout_to_cache: kind lookup failed for post %s, fanning out as feed: %v\n", postID, err)
+		return PostKindFeed, true
+	}
+	return normalizePostKind(onFeed), live
+}
+
 func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData PostData, rowType string) {
 	if rowType == "" {
 		rowType = DefaultFanoutType
+	}
+
+	// A comment bump on an expired moment must not resurface it in anybody's
+	// feed; the feed would filter it out on read anyway, so the row would only
+	// be dead weight in the bucket until its TTL.
+	kind, live := postFanoutKind(ctx, postData.ID)
+	if !live {
+		log.Printf("bulk_fanout_to_cache: post %s is deleted or expired, skipping fanout.\n", postData.ID)
+		return
 	}
 
 	pgQuery := `
@@ -838,8 +900,8 @@ func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData Pos
 	batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
 
 	insertCQL := `
-		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type, triggered_by)
-		VALUES (?, ?, ?, ?, ?, ?)`
+		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type, triggered_by, kind)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`
 
 	nowTimestamp := time.Now()
 
@@ -862,6 +924,7 @@ func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData Pos
 			// on every path that fans out, so a separate field could only ever
 			// disagree with this one.
 			currentEntityID,
+			kind,
 		)
 	}
 
@@ -870,8 +933,8 @@ func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData Pos
 		return
 	}
 
-	log.Printf("bulk_fanout_to_cache: Successfully fanned out Post ID %s for entity %s to %d follower feeds in Astra DB (type=%s).\n",
-		postData.ID, currentEntityID, len(followerIDs), rowType)
+	log.Printf("bulk_fanout_to_cache: Successfully fanned out Post ID %s for entity %s to %d follower feeds in Astra DB (type=%s, kind=%s).\n",
+		postData.ID, currentEntityID, len(followerIDs), rowType, kind)
 }
 
 // mutualConnectionIDs mirrors ConnectionHelpers.get_mutual_connections: the
@@ -968,10 +1031,15 @@ func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID str
 		return
 	}
 
+	// Only posts that are still live: a new follower has no use for the
+	// friend's deleted posts or their expired moments/thoughts, which the feed
+	// would drop on read and which would otherwise sit in the bucket until TTL.
 	const postQuery = `
-		SELECT post_id
+		SELECT post_id, on_feed
 		FROM newsfeed_post
 		WHERE entity_id = $1
+		  AND deleted_at IS NULL
+		  AND (expires_at IS NULL OR expires_at > now())
 		ORDER BY date_posted DESC
 		LIMIT $2`
 
@@ -984,11 +1052,13 @@ func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID str
 
 	var candidateIDs []string
 	candidates := make(map[string]struct{})
+	kinds := make(map[string]string)
 	for postRows.Next() {
-		var pid string
-		if err := postRows.Scan(&pid); err == nil && pid != "" {
+		var pid, onFeed string
+		if err := postRows.Scan(&pid, &onFeed); err == nil && pid != "" {
 			candidateIDs = append(candidateIDs, pid)
 			candidates[pid] = struct{}{}
+			kinds[pid] = normalizePostKind(onFeed)
 		}
 	}
 
@@ -1019,8 +1089,8 @@ func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID str
 	batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
 
 	const insertCQL = `
-		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type, triggered_by)
-		VALUES (?, ?, ?, ?, ?, ?)`
+		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type, triggered_by, kind)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`
 
 	nowTimestamp := time.Now()
 	inserted := 0
@@ -1033,7 +1103,7 @@ func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID str
 		// exist because the viewer just started following THEM, and they wrote
 		// every one of the posts. Kept explicit rather than left null so every
 		// row in the table answers "who put this here".
-		batch.Query(insertCQL, viewerID, pid, nowTimestamp, newFriendID, rowType, newFriendID)
+		batch.Query(insertCQL, viewerID, pid, nowTimestamp, newFriendID, rowType, newFriendID, kinds[pid])
 		inserted++
 	}
 
