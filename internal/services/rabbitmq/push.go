@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	firebase "firebase.google.com/go/v4"
 	"firebase.google.com/go/v4/messaging"
@@ -18,22 +19,28 @@ import (
 )
 
 type SendPushPayload struct {
-	EntityIDs []string          `json:"entity_ids"`
-	Tokens    []string          `json:"tokens"`
-	Channel   string            `json:"channel"`
-	Title     string            `json:"title"`
-	Body      string            `json:"body"`
-	Tag       string            `json:"tag"`
-	ImageURL  string            `json:"image_url"`
-	OSRendered bool             `json:"os_rendered"`
-	Data      map[string]string `json:"data"`
+	EntityIDs  []string `json:"entity_ids"`
+	Tokens     []string `json:"tokens"`
+	Channel    string   `json:"channel"`
+	Title      string   `json:"title"`
+	Body       string   `json:"body"`
+	Tag        string   `json:"tag"`
+	ImageURL   string   `json:"image_url"`
+	OSRendered bool     `json:"os_rendered"`
+	// How long FCM may hold the message for an unreachable device before
+	// discarding it. 0 keeps FCM's default (up to four weeks) - right for a
+	// message, wrong for a call ring that is pointless seconds later.
+	TTLSeconds int               `json:"ttl_seconds"`
+	Data       map[string]string `json:"data"`
 }
 
 const (
 	ChannelMessages = "chatterloop_messages_v2"
 	ChannelActivity = "chatterloop_activity_v2"
+	ChannelCalls    = "chatterloop_calls_v1"
 	SoundMessages   = "message_alert"
 	SoundActivity   = "notification_alert"
+	SoundCalls      = "call_ringtone"
 )
 
 const maxTokensPerSend = 500
@@ -182,8 +189,11 @@ func SendPush(ctx context.Context, payload SendPushPayload) {
 	}
 
 	channel, sound := ChannelActivity, SoundActivity
-	if payload.Channel == ChannelMessages || payload.Channel == "messages" {
+	switch payload.Channel {
+	case ChannelMessages, "messages":
 		channel, sound = ChannelMessages, SoundMessages
+	case ChannelCalls, "calls":
+		channel, sound = ChannelCalls, SoundCalls
 	}
 
 	data := make(map[string]string, len(payload.Data))
@@ -198,6 +208,11 @@ func SendPush(ctx context.Context, payload SendPushPayload) {
 		Android: &messaging.AndroidConfig{
 			Priority: "high",
 		},
+	}
+
+	if payload.TTLSeconds > 0 {
+		ttl := time.Duration(payload.TTLSeconds) * time.Second
+		message.Android.TTL = &ttl
 	}
 
 	if payload.OSRendered {
