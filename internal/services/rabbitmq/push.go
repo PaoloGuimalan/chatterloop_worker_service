@@ -30,14 +30,18 @@ type SendPushPayload struct {
 	// How long FCM may hold the message for an unreachable device before
 	// discarding it. 0 keeps FCM's default (up to four weeks) - right for a
 	// message, wrong for a call ring that is pointless seconds later.
-	TTLSeconds int               `json:"ttl_seconds"`
+	TTLSeconds int `json:"ttl_seconds"`
+	// Every device of EntityIDs, not only the offline ones. Calls use it: an
+	// app the OS has frozen in the background still holds its live
+	// connection, so it looks online and would otherwise never ring.
+	AllDevices bool              `json:"all_devices"`
 	Data       map[string]string `json:"data"`
 }
 
 const (
 	ChannelMessages = "chatterloop_messages_v2"
 	ChannelActivity = "chatterloop_activity_v2"
-	ChannelCalls    = "chatterloop_calls_v1"
+	ChannelCalls    = "chatterloop_calls_v2"
 	SoundMessages   = "message_alert"
 	SoundActivity   = "notification_alert"
 	SoundCalls      = "call_ringtone"
@@ -101,7 +105,7 @@ func messagingClient(ctx context.Context) (*messaging.Client, error) {
 	return fcmClient, fcmErr
 }
 
-func offlineTokensFor(ctx context.Context, entityIDs []string) ([]string, error) {
+func tokensFor(ctx context.Context, entityIDs []string, allDevices bool) ([]string, error) {
 	sessions := connections.Sessions()
 	if sessions == nil {
 		return nil, fmt.Errorf("mongo is not connected")
@@ -119,8 +123,10 @@ func offlineTokensFor(ctx context.Context, entityIDs []string) ([]string, error)
 
 	filter := bson.M{
 		"entityID": bson.M{"$in": ids},
-		"status":   false,
 		"fcmToken": bson.M{"$nin": bson.A{nil, ""}},
+	}
+	if !allDevices {
+		filter["status"] = false
 	}
 
 	cursor, err := sessions.Find(ctx, filter)
@@ -177,7 +183,7 @@ func SendPush(ctx context.Context, payload SendPushPayload) {
 
 	tokens := payload.Tokens
 	if len(tokens) == 0 {
-		tokens, err = offlineTokensFor(ctx, payload.EntityIDs)
+		tokens, err = tokensFor(ctx, payload.EntityIDs, payload.AllDevices)
 		if err != nil {
 			log.Printf("send_push: failed to resolve tokens: %v\n", err)
 			return
