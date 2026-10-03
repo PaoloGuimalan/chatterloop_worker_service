@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 	"worker_service/internal/connections"
+	"worker_service/internal/services/media"
 	"worker_service/internal/services/rabbitmq"
 )
 
@@ -201,6 +202,22 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ) {
 		Timeout: 10 * time.Second,
 		Handler: handle(func(ctx context.Context, p rabbitmq.RemoveFeedPayload) {
 			rabbitmq.RemoveFeedOnUnfriend(ctx, p.ActorID, p.AuthorID, p.Type)
+		}),
+	})
+
+	// Files whose post / comment / message was deleted (published by the Node
+	// server and user_service), and the candidates cron_service's media_cleanup
+	// sweep finds. An account deletion can carry hundreds of files, hence the
+	// long deadline and the small window.
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:    "media_release",
+		Timeout:  5 * time.Minute,
+		Prefetch: 4,
+		Workers:  2,
+		Handler: handle(func(ctx context.Context, p media.ReleasePayload) {
+			if err := media.HandleRelease(ctx, media.DBStore{}, media.DefaultStorage(), p); err != nil {
+				slog.Error("media_release failed; the cleanup sweep will retry", "err", err)
+			}
 		}),
 	})
 
