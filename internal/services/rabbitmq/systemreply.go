@@ -212,33 +212,39 @@ func unarchiveForEveryone(ctx context.Context, conversationID string) {
 // that is not addressing it, which is exactly right - it must not answer the
 // output of a command.
 func announceSystemReply(ctx context.Context, conversationID string, participants []string) {
-	if len(participants) == 0 {
+	publishToEntities(ctx, participants, eventMessagesList, map[string]any{
+		"status": true, "auth": true, "onseen": false,
+		"result": "",
+		"message": map[string]any{
+			"conversationID": conversationID,
+			"entityID":       SystemBotEntityID,
+			"mentioner":      nil,
+			"command":        nil,
+		},
+	})
+}
+
+// publishToEntities sends one realtime frame to each entity's own channel -
+// the events_<id> every open client of theirs is subscribed to.
+//
+// The envelope is the exact one Node and developer_service both publish. A
+// frame in a different shape is one every existing client fails to unwrap.
+func publishToEntities(ctx context.Context, entityIDs []string, event string, message map[string]any) {
+	if len(entityIDs) == 0 {
 		return
 	}
 
 	client := connections.RedisClient()
 	if client == nil {
-		slog.Warn("no redis: the reply is stored but not announced",
-			"conversation_id", conversationID)
+		slog.Warn("no redis: stored but not announced", "event", event)
 		return
 	}
 
 	body, err := json.Marshal(map[string]any{
-		"logType": nil,
-		"pod":     os.Getenv("POD_NAME"),
-		"event":   eventMessagesList,
-		"message": map[string]any{
-			"status": true, "auth": true, "onseen": false,
-			"result": "",
-			"message": map[string]any{
-				"conversationID": conversationID,
-				"entityID":       SystemBotEntityID,
-				"mentioner":      nil,
-				"command":        nil,
-			},
-		},
-		// The exact envelope Node and developer_service both publish. A frame
-		// in a different shape is one every existing client fails to unwrap.
+		"logType":  nil,
+		"pod":      os.Getenv("POD_NAME"),
+		"event":    event,
+		"message":  message,
 		"dateTime": time.Now().UTC().Format(time.RFC3339Nano),
 	})
 	if err != nil {
@@ -246,13 +252,13 @@ func announceSystemReply(ctx context.Context, conversationID string, participant
 		return
 	}
 
-	for _, entityID := range participants {
+	for _, entityID := range entityIDs {
 		if entityID == "" {
 			continue
 		}
 		if err := client.Publish(ctx, "events_"+entityID, body).Err(); err != nil {
-			slog.Warn("could not announce to a participant",
-				"entity_id", entityID, "error", err)
+			slog.Warn("could not announce to an entity",
+				"entity_id", entityID, "event", event, "error", err)
 		}
 	}
 }

@@ -66,6 +66,18 @@ func handle[T any](fn func(ctx context.Context, payload T)) rabbitmq.HandlerFunc
 	}
 }
 
+// handleErr is handle for a worker function that can fail. Its error goes to
+// the consumer: ErrDrop acks it away, anything else is retried once.
+func handleErr[T any](fn func(ctx context.Context, payload T) error) rabbitmq.HandlerFunc {
+	return func(ctx context.Context, body []byte) error {
+		var payload T
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return fmt.Errorf("%w: %v", rabbitmq.ErrDrop, err)
+		}
+		return fn(ctx, payload)
+	}
+}
+
 // initialize_consumers registers every queue subscription, then starts them
 // together. Timeout is the per-message deadline; Workers caps how many messages
 // from that queue run at once, which keeps a large backlog from stampeding
@@ -91,6 +103,15 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ) {
 		Handler: handle(func(ctx context.Context, p rabbitmq.RunCommandPayload) {
 			rabbitmq.RunCommand(ctx, p)
 		}),
+	})
+
+	// A notice line in a conversation - "maya joined" - from a service that
+	// is not the Node server (user_service, on an accepted invite). The
+	// sentence arrives written; see conversationnotice.go.
+	rmq.Register(rabbitmq.ConsumerConfig{
+		Queue:   "post_conversation_notice",
+		Timeout: 15 * time.Second,
+		Handler: handleErr(rabbitmq.PostConversationNotice),
 	})
 
 	rmq.Register(rabbitmq.ConsumerConfig{
