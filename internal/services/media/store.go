@@ -97,14 +97,20 @@ func (s DBStore) IsReported(ctx context.Context, t Target) (bool, error) {
 	return found, err
 }
 
-func (s DBStore) IsTargetLive(ctx context.Context, t Target) (bool, error) {
-	var sql string
-	switch t.Type {
+func targetLivenessSQL(kind string) string {
+	switch kind {
 	case "post":
-		sql = `SELECT EXISTS (SELECT 1 FROM newsfeed_post WHERE post_id = $1 AND deleted_at IS NULL)`
+		return `SELECT EXISTS (SELECT 1 FROM newsfeed_post WHERE post_id = $1 AND deleted_at IS NULL)`
 	case "comment":
-		sql = `SELECT EXISTS (SELECT 1 FROM newsfeed_comment WHERE comment_id = $1 AND deleted_at IS NULL)`
-	case "message":
+		return `SELECT EXISTS (SELECT 1 FROM newsfeed_comment WHERE comment_id = $1 AND deleted_at IS NULL)`
+	case "note":
+		return `SELECT EXISTS (SELECT 1 FROM notes_entry WHERE id = $1)`
+	}
+	return ""
+}
+
+func (s DBStore) IsTargetLive(ctx context.Context, t Target) (bool, error) {
+	if t.Type == "message" {
 		messages, err := collection("messages")
 		if err != nil {
 			return false, err
@@ -113,7 +119,9 @@ func (s DBStore) IsTargetLive(ctx context.Context, t Target) (bool, error) {
 			bson.M{"messageID": t.ID, "isDeleted": bson.M{"$ne": true}},
 		)
 		return n > 0, err
-	default:
+	}
+	sql := targetLivenessSQL(t.Type)
+	if sql == "" {
 		// Unknown kinds (a realm's avatar, ...) count as live: never delete on
 		// a guess.
 		return true, nil
@@ -161,7 +169,8 @@ func (s DBStore) URLInUse(ctx context.Context, rawURL, key string, except *Targe
 	OR EXISTS (
 	     SELECT 1 FROM newsfeed_comment c
 	      WHERE c.attachment = $1 AND c.deleted_at IS NULL AND c.comment_id <> $3)
-	OR EXISTS (SELECT 1 FROM diary_attachment WHERE url = $1)`,
+    OR EXISTS (SELECT 1 FROM diary_attachment WHERE url = $1)
+    OR EXISTS (SELECT 1 FROM notes_attachment WHERE url = $1)`,
 		rawURL, exceptPost, exceptComment,
 	).Scan(&inUse)
 	if err != nil || inUse {

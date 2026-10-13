@@ -13,7 +13,7 @@ import (
 // after the realm type). The bucket is shared with NeonSystems: nothing
 // outside these folders is ever touched.
 var chatterloopKey = regexp.MustCompile(
-	`^uploads/(entries|messages|posts|comments|pages|realms|servers|groups|channels|voices|conferences)/`,
+	`^uploads/(entries|notes|messages|posts|comments|pages|realms|servers|groups|channels|voices|conferences)/`,
 )
 
 // Report target types, as entity_report stores them.
