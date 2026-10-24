@@ -19,14 +19,15 @@ import (
 )
 
 type SendPushPayload struct {
-	EntityIDs  []string `json:"entity_ids"`
-	Tokens     []string `json:"tokens"`
-	Channel    string   `json:"channel"`
-	Title      string   `json:"title"`
-	Body       string   `json:"body"`
-	Tag        string   `json:"tag"`
-	ImageURL   string   `json:"image_url"`
-	OSRendered bool     `json:"os_rendered"`
+	CommunityPostID string   `json:"community_post_id,omitempty"`
+	EntityIDs       []string `json:"entity_ids"`
+	Tokens          []string `json:"tokens"`
+	Channel         string   `json:"channel"`
+	Title           string   `json:"title"`
+	Body            string   `json:"body"`
+	Tag             string   `json:"tag"`
+	ImageURL        string   `json:"image_url"`
+	OSRendered      bool     `json:"os_rendered"`
 	// How long FCM may hold the message for an unreachable device before
 	// discarding it. 0 keeps FCM's default (up to four weeks) - right for a
 	// message, wrong for a call ring that is pointless seconds later.
@@ -175,6 +176,22 @@ func pruneTokens(ctx context.Context, tokens []string) {
 }
 
 func SendPush(ctx context.Context, payload SendPushPayload) {
+	if payload.CommunityPostID != "" {
+		pool := connections.Pool()
+		if pool == nil {
+			log.Print("send_push: community audience unavailable")
+			return
+		}
+		var err error
+		payload, err = prepareCommunityPush(ctx, postgresFanoutStore{db: pool}, payload)
+		if err != nil {
+			log.Printf("send_push: community audience check failed: %v", err)
+			return
+		}
+		if len(payload.EntityIDs) == 0 {
+			return
+		}
+	}
 	client, err := messagingClient(ctx)
 	if err != nil {
 		log.Printf("send_push: FCM not configured, dropping notification: %v\n", err)

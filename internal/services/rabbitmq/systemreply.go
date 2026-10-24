@@ -68,6 +68,17 @@ func PostSystemReply(ctx context.Context, conversationID, text string) error {
 	if conversationID == "" || text == "" {
 		return nil
 	}
+	pool := connections.Pool()
+	if pool == nil {
+		return fmt.Errorf("postgres is not connected")
+	}
+	allowed, err := communityChatAllowed(ctx, pool, conversationID, SystemBotEntityID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return nil
+	}
 
 	messages := connections.Collection("messages")
 	if messages == nil {

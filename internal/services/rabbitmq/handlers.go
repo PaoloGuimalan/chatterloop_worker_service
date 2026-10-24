@@ -14,9 +14,9 @@ import (
 )
 
 type UpdateRankingPayload struct {
-    PostID     string `json:"post_id"`
-    UpdateType string `json:"update_type"`
-    IsDecrease bool	`json:"is_decrease"`
+	PostID     string `json:"post_id"`
+	UpdateType string `json:"update_type"`
+	IsDecrease bool   `json:"is_decrease"`
 }
 
 // InterestIDs are int64, not strings: interests_interest.id is a bigint
@@ -40,7 +40,7 @@ type InteractionBumpPayload struct {
 }
 
 type NewPostCreatedPayload struct {
-	PostID     string    `json:"post_id"`
+	PostID     string `json:"post_id"`
 	DatePosted string `json:"date_posted"`
 }
 
@@ -50,9 +50,12 @@ type PostData struct {
 }
 
 type BulkFanoutPayload struct {
-	PostData        PostData `json:"post_data"`
-	CurrentEntityID string   `json:"current_entity_id"`
-	Type string `json:"type"`
+	PostData        PostData  `json:"post_data"`
+	CurrentEntityID string    `json:"current_entity_id"`
+	Type            string    `json:"type"`
+	CommentID       string    `json:"comment_id,omitempty"`
+	AfterRecipient  string    `json:"after_recipient,omitempty"`
+	IndexedAt       time.Time `json:"indexed_at,omitempty"`
 }
 
 // Why a row is in someone's feed, stored as newsfeed_index.type and read back
@@ -111,7 +114,6 @@ type RemoveEngagementLogPayload struct {
 	TargetID     string `json:"target_id"`
 }
 
-
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -152,7 +154,7 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 		return
 	}
 	postScore, err := pgx.CollectOneRow(scoreRows, pgx.RowToStructByName[models.PostScore])
-	
+
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			postScore = models.PostScore{
@@ -204,26 +206,26 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 
 	newRecentUpdateBoost := postScore.RecentUpdateBoost
 	switch update_type {
-		case "react":
-			if is_decrease {
-				newRecentUpdateBoost -= 0.1
-			} else {
-				newRecentUpdateBoost += 0.1
-			}
-		case "comment":
-			if is_decrease {
-				newRecentUpdateBoost -= 0.3
-			} else {
-				newRecentUpdateBoost += 0.3
-			}
-		case "share":
-			if is_decrease {
-				newRecentUpdateBoost -= 0.5
-			} else {
-				newRecentUpdateBoost += 0.5
-			}
-		default:
-			
+	case "react":
+		if is_decrease {
+			newRecentUpdateBoost -= 0.1
+		} else {
+			newRecentUpdateBoost += 0.1
+		}
+	case "comment":
+		if is_decrease {
+			newRecentUpdateBoost -= 0.3
+		} else {
+			newRecentUpdateBoost += 0.3
+		}
+	case "share":
+		if is_decrease {
+			newRecentUpdateBoost -= 0.5
+		} else {
+			newRecentUpdateBoost += 0.5
+		}
+	default:
+
 		if is_decrease {
 			newRecentUpdateBoost -= 0.1
 		} else {
@@ -233,16 +235,16 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 
 	ageHours := time.Since(postData.DatePosted).Hours()
 	affinityScore := 1.0
-	contentTypeWeight := postScore.ContentTypeWeight 
+	contentTypeWeight := postScore.ContentTypeWeight
 	recentUpdateBoost := newRecentUpdateBoost
 	likesCount := reactionsTotal
 
 	baseEngagement := 1.0
 
 	weightedEngagement := float64(commentsCount)*3.0 + float64(likesCount)*1.0 + float64(sharesCount)*5.0 + baseEngagement
-	
-	decayFactor := math.Pow(ageHours+1.0, 0.5) 
-	
+
+	decayFactor := math.Pow(ageHours+1.0, 0.5)
+
 	rankingScore := (weightedEngagement / decayFactor) * affinityScore * contentTypeWeight * recentUpdateBoost
 
 	upsertQuery := `
@@ -302,7 +304,7 @@ func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem)
 	}
 
 	interestsByPostID := make(map[string][]int64)
-	
+
 	pgQuery := `
 		SELECT pil.post_id, pil.interest_id 
 		FROM interests_postinterestlink pil 
@@ -377,7 +379,7 @@ func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem)
 		go func(id string, interests []int64) {
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			
+
 			BumpInterestAffinity(bgCtx, id, interests, "VIEW", false)
 		}(entityID, allInterestIDs)
 	}
@@ -397,8 +399,8 @@ func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem)
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	for _, logLog := range logsToCreate {
-		batch.Query(insertCQL, 
-			logLog.LogID.String(), logLog.UserID.String(), logLog.ActivityTime, float32(logLog.TimeSpent), 
+		batch.Query(insertCQL,
+			logLog.LogID.String(), logLog.UserID.String(), logLog.ActivityTime, float32(logLog.TimeSpent),
 			logLog.ActivityType, logLog.TargetType, logLog.TargetID, logLog.CreatedAt, logLog.UpdatedAt,
 		)
 	}
@@ -421,16 +423,16 @@ func SaveViewCacheEngagements(entityID string, viewCache []models.ViewCacheItem)
 func BumpInterestAffinity(ctx context.Context, entityID string, interestIDs []int64, action string, isDecrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	var interactionWeights = map[string]float64{
 		"NEW_CONNECTION": 10.0,
-		"SHARE": 7.0,
-		"REPOST": 7.0,
-		"DIARY_TAG": 5.0,
-		"COMMENT": 4.0,
-		"LIKE": 1.0,
-		"VIEW": 0.1,
-		"PROFILE_VISIT": 0.5,
+		"SHARE":          7.0,
+		"REPOST":         7.0,
+		"DIARY_TAG":      5.0,
+		"COMMENT":        4.0,
+		"LIKE":           1.0,
+		"VIEW":           0.1,
+		"PROFILE_VISIT":  0.5,
 	}
 
 	weight, exists := interactionWeights[action]
@@ -503,11 +505,11 @@ var interactionWeights = map[string]float64{
 	"NEW_CONNECTION": 10.0,
 	"SHARE":          7.0,
 	"REPOST":         7.0,
-	"CHAT":          3.0,
-	"COMMENT":       4.0,
-	"LIKE":          1.0,
-	"VIEW":          0.1,
-	"PROFILE_VISIT": 0.5,
+	"CHAT":           3.0,
+	"COMMENT":        4.0,
+	"LIKE":           1.0,
+	"VIEW":           0.1,
+	"PROFILE_VISIT":  0.5,
 }
 
 func InteractionScoreBump(ctx context.Context, actorID string, receiverID string, action string, isDecrease bool) {
@@ -686,7 +688,7 @@ func BumpChatScore(ctx context.Context, actorID string, memberIDs []string, acti
 
 func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted time.Time) {
 	query := "SELECT reference_id, post_id, reference_media_type FROM newsfeed_postreference WHERE post_id = $1"
-	
+
 	rows, err := connections.Pool().Query(ctx, query, postID)
 	if err != nil {
 		log.Printf("Failed to query post references for ID %s: %v\n", postID, err)
@@ -824,117 +826,14 @@ func normalizePostKind(onFeed string) string {
 	}
 }
 
-// postFanoutKind resolves the kind a post fans out as, and whether it is still
-// live (not deleted, not expired).
-//
-// Read here rather than carried in the queue payload: fan-out is published by
-// both Node (new posts) and Django (comment bumps), and the post row is the one
-// place neither can get wrong.
-//
-// Fails OPEN - a lookup error answers (feed, live), which is exactly what
-// fan-out did before kinds existed, so a blip degrades to old behaviour
-// instead of dropping the fan-out.
-func postFanoutKind(ctx context.Context, postID string) (string, bool) {
-	var onFeed string
-	var live bool
-	err := connections.Pool().QueryRow(ctx, `
-		SELECT on_feed,
-		       deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
-		FROM newsfeed_post
-		WHERE post_id = $1`, postID).Scan(&onFeed, &live)
-	if err != nil {
-		log.Printf("bulk_fanout_to_cache: kind lookup failed for post %s, fanning out as feed: %v\n", postID, err)
-		return PostKindFeed, true
+// BulkFanoutToCache resolves audience and identity from storage. Failed lookups
+// stop delivery rather than allowing a private community post into a follower cache.
+func BulkFanoutToCache(ctx context.Context, payload BulkFanoutPayload) error {
+	pool := connections.Pool()
+	if pool == nil {
+		return errors.New("bulk_fanout_to_cache: postgres is not connected")
 	}
-	return normalizePostKind(onFeed), live
-}
-
-func BulkFanoutToCache(ctx context.Context, currentEntityID string, postData PostData, rowType string) {
-	if rowType == "" {
-		rowType = DefaultFanoutType
-	}
-
-	// A comment bump on an expired moment must not resurface it in anybody's
-	// feed; the feed would filter it out on read anyway, so the row would only
-	// be dead weight in the bucket until its TTL.
-	kind, live := postFanoutKind(ctx, postData.ID)
-	if !live {
-		log.Printf("bulk_fanout_to_cache: post %s is deleted or expired, skipping fanout.\n", postData.ID)
-		return
-	}
-
-	pgQuery := `
-		SELECT follower_id 
-		FROM entity_follow 
-		WHERE followee_id = $1 AND status = true 
-		ORDER BY interaction_score DESC, last_interaction_at DESC 
-		LIMIT 500`
-
-	pgRows, err := connections.Pool().Query(ctx, pgQuery, currentEntityID)
-	if err != nil {
-		log.Printf("Failed to resolve follower graph for Entity %s: %v\n", currentEntityID, err)
-		return
-	}
-	defer pgRows.Close()
-
-	var followerIDs []string
-	for pgRows.Next() {
-		var fidStr string
-		if err := pgRows.Scan(&fidStr); err == nil {
-			if fidStr != "" {
-				followerIDs = append(followerIDs, fidStr)
-			}
-		}
-	}
-
-	if len(followerIDs) == 0 {
-		return 
-	}
-
-	session := connections.CassandraSession()
-	if session == nil {
-		log.Println("Astra DB disconnected. Skipping timeline cache fanout.")
-		return
-	}
-
-	batch := session.NewBatch(gocql.UnloggedBatch).WithContext(ctx)
-
-	insertCQL := `
-		INSERT INTO newsfeed_index (bucket, post_id, created_at, author_id, type, triggered_by, kind)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`
-
-	nowTimestamp := time.Now()
-
-	for _, followerID := range followerIDs {
-		batch.Query(insertCQL,
-			followerID,
-			postData.ID,
-			nowTimestamp,
-			postData.AuthorID,
-			rowType,
-			// WHO put this in front of you, which is not always the author:
-			// currentEntityID owns the follower buckets being written, so on a
-			// comment bump it is the COMMENTER while author_id stays the post's
-			// writer. That distinction is the whole point of the caption - it
-			// is what lets the feed say "@handle commented on this post"
-			// instead of implying you follow someone you do not.
-			//
-			// Derived rather than carried in the payload: "whose followers get
-			// this row" and "who caused it" are the same entity by definition
-			// on every path that fans out, so a separate field could only ever
-			// disagree with this one.
-			currentEntityID,
-			kind,
-		)
-	}
-
-	if err := session.ExecuteBatch(batch); err != nil {
-		log.Printf("Error processing serverless Astra timeline fanout batch query: %v\n", err)
-		return
-	}
-
-	log.Printf("bulk_fanout_to_cache: Successfully fanned out Post ID %s for entity %s to %d follower feeds in Astra DB (type=%s, kind=%s).\n",
-		postData.ID, currentEntityID, len(followerIDs), rowType, kind)
+	return runPostFanout(ctx, postgresFanoutStore{db: pool}, payload, writeFanoutBatch, enqueueFanout)
 }
 
 // mutualConnectionIDs mirrors ConnectionHelpers.get_mutual_connections: the
@@ -1062,6 +961,28 @@ func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID str
 		}
 	}
 
+	if err := postRows.Err(); err != nil {
+		log.Printf("backfill_new_friend_feed: post scan failed: %v", err)
+		return
+	}
+	postRows.Close()
+	scopes := make(map[string]fanoutScope)
+	eligible := candidateIDs[:0]
+	store := postgresFanoutStore{db: connections.Pool()}
+	for _, pid := range candidateIDs {
+		scope, err := store.postScope(ctx, pid)
+		if err != nil {
+			log.Printf("backfill_new_friend_feed: scope lookup failed: %v", err)
+			return
+		}
+		if !scope.Live || !scope.allowsFollowerFanout() {
+			delete(candidates, pid)
+			continue
+		}
+		scopes[pid] = scope
+		eligible = append(eligible, pid)
+	}
+	candidateIDs = eligible
 	if len(candidateIDs) == 0 {
 		return
 	}
@@ -1099,11 +1020,14 @@ func BackfillNewFriendFeed(ctx context.Context, viewerID string, newFriendID str
 		if _, alreadyEngaged := skip[pid]; alreadyEngaged {
 			continue
 		}
-		// triggered_by is the new friend here, same as author_id: these rows
-		// exist because the viewer just started following THEM, and they wrote
-		// every one of the posts. Kept explicit rather than left null so every
-		// row in the table answers "who put this here".
-		batch.Query(insertCQL, viewerID, pid, nowTimestamp, newFriendID, rowType, newFriendID, kinds[pid])
+		// Community destinations remain the visible reason even during follower
+		// backfill. The stored author remains private Cassandra index data.
+		scope := scopes[pid]
+		reason, triggeredBy := rowType, scope.AuthorID
+		if scope.CommunityID != "" {
+			reason, triggeredBy = communityFanoutType, scope.CommunityID
+		}
+		batch.Query(insertCQL, viewerID, pid, nowTimestamp, scope.AuthorID, reason, triggeredBy, kinds[pid])
 		inserted++
 	}
 

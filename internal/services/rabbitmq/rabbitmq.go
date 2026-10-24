@@ -58,6 +58,9 @@ type ConsumerConfig struct {
 	Prefetch int
 	Workers  int
 	Timeout  time.Duration
+	// RetryFailures preserves incomplete resumable jobs through an outage.
+	// Ordinary queues retain their existing single-retry policy.
+	RetryFailures bool
 }
 
 func (c *ConsumerConfig) applyDefaults() {
@@ -328,7 +331,7 @@ func (rc *RabbitMQ) process(spec ConsumerConfig, d amqp.Delivery) {
 		slog.Error("dropping unprocessable message", "queue", spec.Queue, "err", err)
 		rc.ack(spec.Queue, d)
 
-	case d.Redelivered:
+	case d.Redelivered && !spec.RetryFailures:
 		// Already retried once. Requeueing again would loop forever, so drop it
 		// with a loud log rather than block the queue.
 		slog.Error("dropping message after failed retry", "queue", spec.Queue, "err", err)

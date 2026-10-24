@@ -9,7 +9,7 @@ import (
 
 // A voice room and a page have no chat to write in - Node refuses them too.
 func TestNoticeSkipsRealmsWithoutAChat(t *testing.T) {
-	for _, realmType := range []string{"voice", "page", "VOICE"} {
+	for _, realmType := range []string{"voice", "page", "VOICE", "community", "COMMUNITY"} {
 		if _, ok := noticeConversationType(realmType); ok {
 			t.Fatalf("%q must have no notices", realmType)
 		}

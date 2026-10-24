@@ -62,7 +62,7 @@ const eventContactsList = "contactslist"
 // Node's normalizeConversationType, plus its voice/page refusal.
 func noticeConversationType(realmType string) (string, bool) {
 	switch strings.ToLower(realmType) {
-	case "voice", "page":
+	case "voice", "page", "community":
 		return "", false
 	case "server":
 		return "channel", true
@@ -82,13 +82,27 @@ func PostConversationNotice(ctx context.Context, p ConversationNoticePayload) er
 	if p.ConversationID == "" || p.ActorEntityID == "" || p.Text == "" {
 		return fmt.Errorf("%w: conversation_id, actor_entity_id and text are required", ErrDrop)
 	}
+	pool := connections.Pool()
+	if pool == nil {
+		return fmt.Errorf("postgres is not connected")
+	}
+	allowed, err := communityChatAllowed(ctx, pool, p.ConversationID, p.ActorEntityID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return nil
+	}
 
 	messages := connections.Collection("messages")
 	if messages == nil {
 		return fmt.Errorf("mongo is not connected")
 	}
 
-	realm, isRealm := realmOf(ctx, p.ConversationID)
+	realm, isRealm, err := realmOf(ctx, p.ConversationID)
+	if err != nil {
+		return err
+	}
 	var members []string
 	conversationType := "single"
 	conversationName := ""
@@ -162,10 +176,10 @@ type noticeRealm struct {
 
 // realmOf reads the realm a conversation belongs to - a group's or a
 // channel's conversation id IS its realm_id. False for a direct conversation.
-func realmOf(ctx context.Context, conversationID string) (noticeRealm, bool) {
+func realmOf(ctx context.Context, conversationID string) (noticeRealm, bool, error) {
 	pool := connections.Pool()
 	if pool == nil {
-		return noticeRealm{}, false
+		return noticeRealm{}, false, fmt.Errorf("postgres is not connected")
 	}
 	var realm noticeRealm
 	err := pool.QueryRow(ctx,
@@ -177,9 +191,12 @@ func realmOf(ctx context.Context, conversationID string) (noticeRealm, bool) {
 		if err != pgx.ErrNoRows {
 			slog.Warn("could not read the realm", "conversation_id", conversationID, "error", err)
 		}
-		return noticeRealm{}, false
+		if err == pgx.ErrNoRows {
+			return noticeRealm{}, false, nil
+		}
+		return noticeRealm{}, false, err
 	}
-	return realm, true
+	return realm, true, nil
 }
 
 // realmMembers is everyone in the realm now - users, pages and bots alike, as

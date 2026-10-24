@@ -163,13 +163,7 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ) {
 		}),
 	})
 
-	rmq.Register(rabbitmq.ConsumerConfig{
-		Queue:   "bulk_fanout_to_cache",
-		Timeout: 10 * time.Second,
-		Handler: handle(func(ctx context.Context, p rabbitmq.BulkFanoutPayload) {
-			rabbitmq.BulkFanoutToCache(ctx, p.CurrentEntityID, p.PostData, p.Type)
-		}),
-	})
+	rmq.Register(rabbitmq.BulkFanoutConsumer())
 
 	// Fan-out over a whole friend graph is the heaviest job here, so it runs with
 	// a small window to avoid saturating Astra.
