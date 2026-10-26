@@ -123,6 +123,32 @@ func TestFollowerBackfillCannotWidenCommunityAudience(t *testing.T) {
 	}
 }
 
+func TestNamedCommunityCommentRetainsSocialReason(t *testing.T) {
+	for _, private := range []bool{false, true} {
+		store := &memoryFanoutStore{scope: fanoutScope{AuthorID: "author", Kind: "feed", Live: true, RealmID: "realm", CommunityID: "community", Private: private}, members: []string{"member"}, followers: []string{"follower"}, commentAuthor: "named-commenter"}
+		var got []feedIndexRow
+		err := runAllFanout(context.Background(), store, "forged", PostData{ID: "post"}, "comment", "comment", func(rows []feedIndexRow) error { got = append(got, rows...); return nil })
+		if err != nil || len(got) == 0 {
+			t.Fatalf("missing fanout: %v %v", got, err)
+		}
+		for _, row := range got {
+			if row.Type != "comment" || row.TriggeredBy != "named-commenter" {
+				t.Fatalf("named reason lost: %+v", row)
+			}
+			if private && row.RecipientID == "follower" {
+				t.Fatal("private community membership leaked")
+			}
+		}
+	}
+}
+
+func TestCommunityMediaUpdatesDoNotReachFollowers(t *testing.T) {
+	scope := fanoutScope{AuthorID: "community", CommunityID: "community", Live: true, Kind: "feed"}
+	if scope.allowsFollowerFanout() {
+		t.Fatal("community's own system media must be member-only")
+	}
+}
+
 type chatGuardDB struct {
 	community bool
 	err       error

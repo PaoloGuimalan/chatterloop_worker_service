@@ -32,7 +32,8 @@ type feedIndexRow struct {
 }
 
 func (s fanoutScope) allowsFollowerFanout() bool {
-	return !s.Anonymous && (s.CommunityID == "" || !s.Private)
+	// Community-authored system media updates are intended for members only.
+	return !s.Anonymous && (s.CommunityID == "" || (!s.Private && s.AuthorID != s.CommunityID))
 }
 
 type rowQuerier interface {
@@ -134,7 +135,7 @@ func runPostFanout(ctx context.Context, store fanoutStore, job BulkFanoutPayload
 		}
 	}
 	triggeredBy := followerID
-	if scope.CommunityID != "" {
+	if scope.CommunityID != "" && (rowType != CommentFanoutType || followerID == "") {
 		rowType, triggeredBy = communityFanoutType, scope.CommunityID
 	}
 	if !scope.allowsFollowerFanout() {
