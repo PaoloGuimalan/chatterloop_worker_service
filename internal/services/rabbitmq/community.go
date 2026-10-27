@@ -162,8 +162,9 @@ func runPostFanout(ctx context.Context, store fanoutStore, job BulkFanoutPayload
 	}
 	rows := make([]feedIndexRow, 0, len(ids))
 	seen := make(map[string]bool, len(ids))
+	externalComment := rowType == CommentFanoutType && triggeredBy != "" && triggeredBy != scope.AuthorID
 	for _, id := range ids {
-		if id == "" || seen[id] {
+		if id == "" || seen[id] || (id == scope.AuthorID && !externalComment) {
 			continue
 		}
 		seen[id] = true

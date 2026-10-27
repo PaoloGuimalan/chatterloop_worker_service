@@ -320,3 +320,26 @@ func TestFanoutLookupAndWriteFailuresStopDelivery(t *testing.T) {
 		t.Fatalf("want write error, got %v", err)
 	}
 }
+
+func TestAuthorReceivesOnlyNamedExternalCommentResurfaces(t *testing.T) {
+	for _, activity := range []string{"fanout", "comment"} {
+		store := &memoryFanoutStore{scope: fanoutScope{AuthorID: "author", Kind: "feed", Live: true,
+			RealmID: "realm", CommunityID: "community", Private: true}, members: []string{"author", "member"},
+			commentAuthor: "friend"}
+		var rows []feedIndexRow
+		err := runAllFanout(context.Background(), store, "friend", PostData{ID: "post"}, activity, "comment",
+			func(batch []feedIndexRow) error { rows = append(rows, batch...); return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		sawAuthor := false
+		for _, row := range rows {
+			if row.RecipientID == "author" {
+				sawAuthor = true
+			}
+		}
+		if sawAuthor != (activity == "comment") {
+			t.Fatalf("activity=%s rows=%+v", activity, rows)
+		}
+	}
+}
