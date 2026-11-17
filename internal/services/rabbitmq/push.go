@@ -176,7 +176,22 @@ func pruneTokens(ctx context.Context, tokens []string) {
 }
 
 func SendPush(ctx context.Context, payload SendPushPayload) {
-	if payload.CommunityPostID != "" {
+	if payload.Data["type"] == "community_post_decision" {
+		pool := connections.Pool()
+		if pool == nil {
+			log.Print("send_push: decision audience unavailable")
+			return
+		}
+		var err error
+		payload, err = prepareCommunityDecisionPush(ctx, pool, payload)
+		if err != nil {
+			log.Printf("send_push: decision audience check failed: %v", err)
+			return
+		}
+		if len(payload.EntityIDs) == 0 {
+			return
+		}
+	} else if payload.CommunityPostID != "" {
 		pool := connections.Pool()
 		if pool == nil {
 			log.Print("send_push: community audience unavailable")

@@ -45,6 +45,36 @@ type communityPushStore interface {
 	currentMembers(context.Context, string, []string) ([]string, error)
 }
 
+// A review reason belongs to its actual author even after membership removal.
+// This exception never makes the original private post visible or pushable.
+func prepareCommunityDecisionPush(ctx context.Context, db rowQuerier, payload SendPushPayload) (SendPushPayload, error) {
+	if db == nil {
+		return SendPushPayload{}, fmt.Errorf("postgres is not connected")
+	}
+	var decisionID, authorID string
+	err := db.QueryRow(ctx, `SELECT d.id::text, p.entity_id::text
+		FROM community_approvals d JOIN newsfeed_post p ON p.post_id = d.target_id
+		JOIN community_realm r ON r.id = d.realm_id AND r.type = 'community'
+		WHERE d.id = $1::uuid AND d.target_kind = 'post' AND d.action IN ('approve','reject','takedown')`,
+		payload.Data["reviewDecisionID"]).Scan(&decisionID, &authorID)
+	if err != nil {
+		return SendPushPayload{}, err
+	}
+	var recipients []string
+	for _, id := range payload.EntityIDs {
+		if id == authorID {
+			recipients = []string{authorID}
+			break
+		}
+	}
+	payload.EntityIDs, payload.Tokens, payload.ImageURL = recipients, nil, ""
+	payload.Title, payload.Body = "Community post decision", "Your community post was reviewed."
+	payload.Tag, payload.Channel, payload.CommunityPostID = "community-decision-"+decisionID, ChannelActivity, ""
+	payload.Data = map[string]string{"type": "community_post_decision", "title": payload.Title, "body": payload.Body,
+		"route": "/realm-review/" + url.PathEscape(decisionID), "reviewDecisionID": decisionID}
+	return payload, nil
+}
+
 func prepareCommunityPush(ctx context.Context, store communityPushStore, payload SendPushPayload) (SendPushPayload, error) {
 	if payload.CommunityPostID == "" {
 		return payload, nil
@@ -219,7 +249,8 @@ func (s postgresFanoutStore) postScope(ctx context.Context, postID string) (fano
 	err := s.db.QueryRow(ctx, `
 		SELECT p.entity_id::text, p.on_feed,
 		       p.deleted_at IS NULL AND (p.expires_at IS NULL OR p.expires_at > now())
-		       AND coalesce(c.active, true), p.is_anonymous,
+		       AND coalesce(c.active, true)
+		       AND (coalesce(c.destinations, 0) = 0 OR p.approval = 1), p.is_anonymous,
 		       coalesce(c.realm_id, ''), coalesce(c.entity_id, ''),
 		       coalesce(c.is_private, false), c.destinations, p.date_posted
 		FROM newsfeed_post p

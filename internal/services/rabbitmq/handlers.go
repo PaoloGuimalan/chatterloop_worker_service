@@ -19,6 +19,35 @@ type UpdateRankingPayload struct {
 	IsDecrease bool   `json:"is_decrease"`
 }
 
+const rankingPostSQL = `
+        SELECT post_id, entity_id, is_shared, file_type, caption, content_type,
+               is_tagged, privacy_status, is_sponsored, is_live, is_archived,
+               on_feed, date_posted, from_system, deleted_at, deleted_by_id
+        FROM newsfeed_post WHERE post_id = $1`
+
+const initialPostScoreSQL = `
+        INSERT INTO newsfeed_postscore (
+            post_id, affinity_score, content_type_weight, recent_update_boost,
+            likes_count, comments_count, shares_count, ranking_score
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (post_id) DO NOTHING`
+
+func rankingRecentBoost(current float64, updateType string, decrease bool) float64 {
+	delta := 0.1
+	switch updateType {
+	case "comment":
+		delta = 0.3
+	case "share":
+		delta = 0.5
+	case "refresh":
+		delta = 0
+	}
+	if decrease {
+		return current - delta
+	}
+	return current + delta
+}
+
 // InterestIDs are int64, not strings: interests_interest.id is a bigint
 // (Django's default AutoField pk), so newsfeed/views.py and the diary
 // publishers put JSON NUMBERS on the wire. Declared as []string the whole
@@ -117,6 +146,15 @@ type RemoveEngagementLogPayload struct {
 func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	updateRankingScore(ctx, connections.Pool(), post_id, update_type, is_decrease)
+}
+
+type rankingDB interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+func updateRankingScore(ctx context.Context, db rankingDB, post_id string, update_type string, is_decrease bool) {
 
 	// Every failure below abandons this one message and returns, matching how
 	// the rest of this file handles errors. A bad post id or a blipped
@@ -128,12 +166,7 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	// migration added a column (expires_at) ahead of a worker redeploy - and a
 	// struct field with no column breaks it the other way round. Listing the
 	// columns makes deploy order irrelevant.
-	postRows, err := connections.Pool().Query(ctx, `
-		SELECT post_id, entity_id, is_shared, file_type, caption, content_type,
-		       is_tagged, privacy_status, is_sponsored, is_live, is_archived,
-		       on_feed, date_posted, from_system, deleted_at, deleted_by_id
-		FROM newsfeed_post
-		WHERE post_id = $1`, post_id)
+	postRows, err := db.Query(ctx, rankingPostSQL, post_id)
 	if err != nil {
 		log.Printf("update_ranking_score: failed to query post %s: %v\n", post_id, err)
 		return
@@ -148,7 +181,18 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 		return
 	}
 
-	scoreRows, err := connections.Pool().Query(ctx, "SELECT * FROM newsfeed_postscore WHERE post_id = $1", post_id)
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		log.Printf("update_ranking_score: failed to begin: %v", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+	// Serialize all read/modify/write ranking jobs with SQL-applied review share deltas.
+	if _, err := tx.Exec(ctx, initialPostScoreSQL, post_id, 1., 1., 1., 0, 0, 0, 0.); err != nil {
+		log.Printf("update_ranking_score: failed to ensure score: %v", err)
+		return
+	}
+	scoreRows, err := tx.Query(ctx, "SELECT * FROM newsfeed_postscore WHERE post_id = $1 FOR UPDATE", post_id)
 	if err != nil {
 		log.Printf("update_ranking_score: failed to query score for post %s: %v\n", post_id, err)
 		return
@@ -204,34 +248,7 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 		}
 	}
 
-	newRecentUpdateBoost := postScore.RecentUpdateBoost
-	switch update_type {
-	case "react":
-		if is_decrease {
-			newRecentUpdateBoost -= 0.1
-		} else {
-			newRecentUpdateBoost += 0.1
-		}
-	case "comment":
-		if is_decrease {
-			newRecentUpdateBoost -= 0.3
-		} else {
-			newRecentUpdateBoost += 0.3
-		}
-	case "share":
-		if is_decrease {
-			newRecentUpdateBoost -= 0.5
-		} else {
-			newRecentUpdateBoost += 0.5
-		}
-	default:
-
-		if is_decrease {
-			newRecentUpdateBoost -= 0.1
-		} else {
-			newRecentUpdateBoost += 0.1
-		}
-	}
+	newRecentUpdateBoost := rankingRecentBoost(postScore.RecentUpdateBoost, update_type, is_decrease)
 
 	ageHours := time.Since(postData.DatePosted).Hours()
 	affinityScore := 1.0
@@ -261,7 +278,7 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 			shares_count = EXCLUDED.shares_count,
 			ranking_score = EXCLUDED.ranking_score;`
 
-	_, err = connections.Pool().Exec(ctx, upsertQuery,
+	_, err = tx.Exec(ctx, upsertQuery,
 		post_id,
 		affinityScore,
 		contentTypeWeight,
@@ -273,6 +290,10 @@ func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
 	)
 	if err != nil {
 		log.Printf("update_ranking_score: failed to upsert score for post %s: %v\n", post_id, err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("update_ranking_score: failed to commit: %v", err)
 		return
 	}
 
@@ -776,21 +797,7 @@ func CreatePostScoreForNewPost(ctx context.Context, postID string, datePosted ti
 
 	rankingScore := (weightedEngagement / decayFactor) * affinityScore * contentTypeWeight * recentUpdateBoost
 
-	upsertQuery := `
-		INSERT INTO newsfeed_postscore (
-			post_id, affinity_score, content_type_weight, recent_update_boost, 
-			likes_count, comments_count, shares_count, ranking_score
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (post_id) DO UPDATE SET
-			affinity_score = EXCLUDED.affinity_score,
-			content_type_weight = EXCLUDED.content_type_weight,
-			recent_update_boost = EXCLUDED.recent_update_boost,
-			likes_count = EXCLUDED.likes_count,
-			comments_count = EXCLUDED.comments_count,
-			shares_count = EXCLUDED.shares_count,
-			ranking_score = EXCLUDED.ranking_score;`
-
-	_, err = connections.Pool().Exec(ctx, upsertQuery,
+	_, err = connections.Pool().Exec(ctx, initialPostScoreSQL,
 		postID,
 		affinityScore,
 		contentTypeWeight,
