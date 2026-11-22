@@ -1,0 +1,596 @@
+[
+  {
+    "table": "bot_bot",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "preserve_unrelated_identity"
+  },
+  {
+    "table": "bot_bot",
+    "column": "owner_entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "CASCADE",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "community_approvals",
+    "column": "actor_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "PROTECT",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "community_approvals",
+    "column": "realm_id",
+    "target": "community_realm",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "PROTECT",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "community_invite",
+    "column": "accepted_by_entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "SET_NULL",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "community_invite",
+    "column": "created_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "community_invite",
+    "column": "realm_id",
+    "target": "community_realm",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "community_invite",
+    "column": "role_id",
+    "target": "entity_role",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "PROTECT",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "community_invite",
+    "column": "target_entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "SET_NULL",
+    "policy": "settle_invite_and_detach"
+  },
+  {
+    "table": "community_member",
+    "column": "added_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "community_member",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "community_member",
+    "column": "realm_id",
+    "target": "community_realm",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "community_member",
+    "column": "role_id",
+    "target": "entity_role",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "PROTECT",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "community_realm",
+    "column": "created_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "community_realm",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "community_realm",
+    "column": "parent_id",
+    "target": "community_realm",
+    "target_column": "realm_id",
+    "nullable": true,
+    "on_delete": "SET_NULL",
+    "policy": "delete_structural_children_first"
+  },
+  {
+    "table": "entity_block",
+    "column": "blocked_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_block",
+    "column": "blocker_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_connection",
+    "column": "action_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_connection",
+    "column": "involved_entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_encryption_configuration",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_encryption_configuration",
+    "column": "replaces_id",
+    "target": "entity_encryption_configuration",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "PROTECT",
+    "policy": "detach_nullable"
+  },
+  {
+    "table": "entity_encryption_configuration_purposes",
+    "column": "encryptionconfiguration_id",
+    "target": "entity_encryption_configuration",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_follow",
+    "column": "followee_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_follow",
+    "column": "follower_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_permission",
+    "column": "created_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "SET_NULL",
+    "policy": "detach_nullable"
+  },
+  {
+    "table": "entity_permission",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_permission",
+    "column": "realm_id",
+    "target": "community_realm",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_report",
+    "column": "reported_entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "entity_report",
+    "column": "reporter_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "entity_report",
+    "column": "reviewed_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "DO_NOTHING",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "entity_role",
+    "column": "realm_id",
+    "target": "community_realm",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_role_permissions",
+    "column": "role_id",
+    "target": "entity_role",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_token",
+    "column": "created_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "SET_NULL",
+    "policy": "detach_nullable"
+  },
+  {
+    "table": "entity_token",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "entity_token",
+    "column": "realm_id",
+    "target": "community_realm",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "interests_entityinterest",
+    "column": "created_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "SET_NULL",
+    "policy": "detach_nullable"
+  },
+  {
+    "table": "interests_entityinterest",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "interests_entityinterestaffinity",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "interests_postinterestlink",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_activitycount",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_comment",
+    "column": "deleted_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "DO_NOTHING",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "newsfeed_comment",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "redact_owned_comment_and_recount"
+  },
+  {
+    "table": "newsfeed_comment",
+    "column": "parent_comment_id",
+    "target": "newsfeed_comment",
+    "target_column": "comment_id",
+    "nullable": true,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_comment",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_commentpreviewcount",
+    "column": "comment_id",
+    "target": "newsfeed_comment",
+    "target_column": "comment_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_commentreaction",
+    "column": "comment_id",
+    "target": "newsfeed_comment",
+    "target_column": "comment_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_commentreaction",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_owned_reaction_and_recount"
+  },
+  {
+    "table": "newsfeed_mapview",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_post",
+    "column": "deleted_by_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": true,
+    "on_delete": "DO_NOTHING",
+    "policy": "preserve_tombstone"
+  },
+  {
+    "table": "newsfeed_post",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_postprivacy",
+    "column": "allowed_entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_postprivacy",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_postreference",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_postsave",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_postsave",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_postscore",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_posttag",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_posttag",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_previewcount",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "newsfeed_reaction",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "delete_owned_reaction_and_recount"
+  },
+  {
+    "table": "newsfeed_reaction",
+    "column": "post_id",
+    "target": "newsfeed_post",
+    "target_column": "post_id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "notes_attachment",
+    "column": "note_id",
+    "target": "notes_entry",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "notes_entry",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "delete_scoped"
+  },
+  {
+    "table": "user_account",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "CASCADE",
+    "policy": "preserve_unrelated_identity"
+  },
+  {
+    "table": "user_userconsent",
+    "column": "entity_id",
+    "target": "entity_entity",
+    "target_column": "id",
+    "nullable": false,
+    "on_delete": "DO_NOTHING",
+    "policy": "preserve_tombstone"
+  }
+]

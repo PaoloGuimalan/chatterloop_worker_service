@@ -58,6 +58,8 @@ type ConsumerConfig struct {
 	Prefetch int
 	Workers  int
 	Timeout  time.Duration
+	// Only resumable batch jobs with their own progress/idle lease opt in.
+	UntilShutdown bool
 	// RetryFailures preserves incomplete resumable jobs through an outage.
 	// Ordinary queues retain their existing single-retry policy.
 	RetryFailures bool
@@ -307,6 +309,17 @@ func (rc *RabbitMQ) attach(conn *amqp.Connection, spec ConsumerConfig) error {
 // here so one bad message cannot take down the worker pool.
 func (rc *RabbitMQ) process(spec ConsumerConfig, d amqp.Delivery) {
 	ctx, cancel := context.WithTimeout(context.Background(), spec.Timeout)
+	if spec.UntilShutdown {
+		cancel()
+		ctx, cancel = context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-rc.shutdown:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
 	defer cancel()
 
 	err := func() (err error) {

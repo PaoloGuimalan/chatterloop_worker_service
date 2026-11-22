@@ -61,10 +61,18 @@ func SendEmail(to []string, from, subject, body string) {
 	// with no Date or MIME-Version is far more likely to be filed as spam.
 	// The subject is Q-encoded so a non-ASCII display name or emoji survives.
 	var msg strings.Builder
-	msg.WriteString("From: ");msg.WriteString(from);msg.WriteString("\r\n")
-	msg.WriteString("To: ");msg.WriteString(strings.Join(recipients, ", "));msg.WriteString("\r\n")
-	msg.WriteString("Subject: ");msg.WriteString(mime.QEncoding.Encode("utf-8", subject));msg.WriteString("\r\n")
-	msg.WriteString("Date: ");msg.WriteString(time.Now().Format(time.RFC1123Z));msg.WriteString("\r\n")
+	msg.WriteString("From: ")
+	msg.WriteString(from)
+	msg.WriteString("\r\n")
+	msg.WriteString("To: ")
+	msg.WriteString(strings.Join(recipients, ", "))
+	msg.WriteString("\r\n")
+	msg.WriteString("Subject: ")
+	msg.WriteString(mime.QEncoding.Encode("utf-8", subject))
+	msg.WriteString("\r\n")
+	msg.WriteString("Date: ")
+	msg.WriteString(time.Now().Format(time.RFC1123Z))
+	msg.WriteString("\r\n")
 	msg.WriteString("MIME-Version: 1.0\r\n")
 	msg.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
 	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")

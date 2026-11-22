@@ -13,7 +13,7 @@ import (
 // after the realm type). The bucket is shared with NeonSystems: nothing
 // outside these folders is ever touched.
 var chatterloopKey = regexp.MustCompile(
-	`^uploads/(entries|notes|messages|posts|comments|pages|realms|servers|groups|channels|voices|conferences)/`,
+	`^uploads/(entries|notes|messages|posts|comments|pages|realms|servers|groups|channels|voices|conferences|communities)/`,
 )
 
 // Report target types, as entity_report stores them.
@@ -146,6 +146,21 @@ func ReleaseFile(ctx context.Context, store Store, bucket Bucket, rawURL string,
 	if target != nil && reportable[target.Type] {
 		if reported, err = store.IsReported(ctx, *target); err != nil {
 			return Outcome{}, fmt.Errorf("report check: %w", err)
+		}
+	}
+	// A whole-scope deletion may mark both attachments deleted before this
+	// release runs. A report on either attachment still protects the shared file.
+	if !reported {
+		for _, other := range others {
+			if !reportable[other.Type] {
+				continue
+			}
+			if reported, err = store.IsReported(ctx, other); err != nil {
+				return Outcome{}, fmt.Errorf("shared report check: %w", err)
+			}
+			if reported {
+				break
+			}
 		}
 	}
 	if reported || (record != nil && record.Status == "held") {

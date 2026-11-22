@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"time"
 	"worker_service/internal/connections"
+	"worker_service/internal/services/realmlifecycle"
 
 	"github.com/gocql/gocql"
 	"github.com/jackc/pgx/v5"
@@ -55,7 +56,8 @@ func prepareCommunityDecisionPush(ctx context.Context, db rowQuerier, payload Se
 	err := db.QueryRow(ctx, `SELECT d.id::text, p.entity_id::text
 		FROM community_approvals d JOIN newsfeed_post p ON p.post_id = d.target_id
 		JOIN community_realm r ON r.id = d.realm_id AND r.type = 'community'
-		WHERE d.id = $1::uuid AND d.target_kind = 'post' AND d.action IN ('approve','reject','takedown')`,
+		WHERE d.id = $1::uuid AND d.target_kind = 'post' AND d.action IN ('approve','reject','takedown')
+		 AND `+realmlifecycle.ActiveRealmSQL("r")+` AND `+realmlifecycle.AuthorRealmAvailableSQL("p.entity_id"),
 		payload.Data["reviewDecisionID"]).Scan(&decisionID, &authorID)
 	if err != nil {
 		return SendPushPayload{}, err
@@ -111,15 +113,17 @@ func communityChatAllowed(ctx context.Context, db rowQuerier, conversationID, ac
 	if db == nil {
 		return false, fmt.Errorf("postgres is not connected")
 	}
-	var community bool
+	var blocked bool
 	err := db.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM community_realm WHERE type = 'community'
-		AND (realm_id = $1 OR id = $1 OR entity_id::text = $1 OR entity_id::text = $2)
-	)`, conversationID, actorID).Scan(&community)
+		SELECT 1 FROM community_realm r WHERE
+		(realm_id = $1 OR id = $1 OR entity_id::text = $1 OR entity_id::text = $2)
+		AND (r.type='community' OR NOT `+realmlifecycle.ActiveRealmSQL("r")+`)
+	) OR EXISTS (SELECT 1 FROM entity_entity actor WHERE actor.id=$2 AND actor.type='realm'
+	 AND NOT EXISTS (SELECT 1 FROM community_realm r WHERE r.entity_id=actor.id AND `+realmlifecycle.ActiveRealmSQL("r")+`))`, conversationID, actorID).Scan(&blocked)
 	if err != nil {
 		return false, err
 	}
-	return !community, nil
+	return !blocked, nil
 }
 
 // Each delivery writes at most one page. Its original checkpoint remains on the
@@ -250,6 +254,7 @@ func (s postgresFanoutStore) postScope(ctx context.Context, postID string) (fano
 		SELECT p.entity_id::text, p.on_feed,
 		       p.deleted_at IS NULL AND (p.expires_at IS NULL OR p.expires_at > now())
 		       AND coalesce(c.active, true)
+		       AND `+realmlifecycle.AuthorRealmAvailableSQL("p.entity_id")+`
 		       AND (coalesce(c.destinations, 0) = 0 OR p.approval = 1), p.is_anonymous,
 		       coalesce(c.realm_id, ''), coalesce(c.entity_id, ''),
 		       coalesce(c.is_private, false), c.destinations, p.date_posted
@@ -257,7 +262,7 @@ func (s postgresFanoutStore) postScope(ctx context.Context, postID string) (fano
 		LEFT JOIN LATERAL (
 		    SELECT min(r.id) AS realm_id, min(r.entity_id::text) AS entity_id,
 		           bool_or(r.is_private) AS is_private,
-		           bool_and(r.is_active AND (r.expires_at IS NULL OR r.expires_at > now())) AS active,
+		           bool_and(`+realmlifecycle.ActiveRealmSQL("r")+` AND (r.expires_at IS NULL OR r.expires_at > now())) AS active,
 		           count(DISTINCT r.id) AS destinations
 		    FROM newsfeed_posttag t JOIN community_realm r ON r.entity_id = t.entity_id
 		    WHERE t.post_id = p.post_id AND r.type = 'community'
@@ -281,7 +286,8 @@ func (s postgresFanoutStore) commentActor(ctx context.Context, postID, commentID
 	var anonymous bool
 	var at time.Time
 	err := s.db.QueryRow(ctx, `SELECT entity_id::text, is_anonymous, created_at FROM newsfeed_comment
-		WHERE comment_id = $1 AND post_id = $2 AND deleted_at IS NULL`, commentID, postID).Scan(&actor, &anonymous, &at)
+		WHERE comment_id = $1 AND post_id = $2 AND deleted_at IS NULL
+		 AND `+realmlifecycle.AuthorRealmAvailableSQL("newsfeed_comment.entity_id"), commentID, postID).Scan(&actor, &anonymous, &at)
 	return actor, anonymous, at, err
 }
 

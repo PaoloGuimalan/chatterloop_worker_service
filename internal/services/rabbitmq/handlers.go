@@ -14,9 +14,10 @@ import (
 )
 
 type UpdateRankingPayload struct {
-	PostID     string `json:"post_id"`
-	UpdateType string `json:"update_type"`
-	IsDecrease bool   `json:"is_decrease"`
+	PostID           string `json:"post_id"`
+	UpdateType       string `json:"update_type"`
+	IsDecrease       bool   `json:"is_decrease"`
+	SourceActivityID string `json:"source_activity_id,omitempty"`
 }
 
 const rankingPostSQL = `
@@ -143,10 +144,10 @@ type RemoveEngagementLogPayload struct {
 	TargetID     string `json:"target_id"`
 }
 
-func UpdateRankingScore(post_id string, update_type string, is_decrease bool) {
+func UpdateRankingScore(post_id string, update_type string, is_decrease bool, sourceActivityIDs ...string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	updateRankingScore(ctx, connections.Pool(), post_id, update_type, is_decrease)
+	updateRankingScore(ctx, connections.Pool(), post_id, update_type, is_decrease, sourceActivityIDs...)
 }
 
 type rankingDB interface {
@@ -154,7 +155,7 @@ type rankingDB interface {
 	Begin(context.Context) (pgx.Tx, error)
 }
 
-func updateRankingScore(ctx context.Context, db rankingDB, post_id string, update_type string, is_decrease bool) {
+func updateRankingScore(ctx context.Context, db rankingDB, post_id string, update_type string, is_decrease bool, sourceActivityIDs ...string) {
 
 	// Every failure below abandons this one message and returns, matching how
 	// the rest of this file handles errors. A bad post id or a blipped
@@ -217,6 +218,27 @@ func updateRankingScore(ctx context.Context, db rankingDB, post_id string, updat
 		}
 	}
 
+	// Check only jobs carrying a stored activity reference, under the same
+	// score lock as cleanup's decrement. Legacy/personal app jobs are unchanged.
+	if !is_decrease && len(sourceActivityIDs) > 0 && sourceActivityIDs[0] != "" {
+		query := ""
+		switch update_type {
+		case "comment":
+			query = `SELECT EXISTS(SELECT 1 FROM newsfeed_comment WHERE comment_id=$1 AND post_id=$2 AND deleted_at IS NULL)`
+		case "react":
+			query = `SELECT EXISTS(SELECT 1 FROM newsfeed_reaction WHERE reaction_id=$1 AND post_id=$2)`
+		}
+		if query != "" {
+			var live bool
+			if err := tx.QueryRow(ctx, query, sourceActivityIDs[0], post_id).Scan(&live); err != nil {
+				log.Printf("update_ranking_score: activity lookup failed: %v", err)
+				return
+			}
+			if !live {
+				return
+			}
+		}
+	}
 	reactions := postScore.LikesCount
 	reactionsTotal := reactions
 	commentsCount := postScore.CommentsCount

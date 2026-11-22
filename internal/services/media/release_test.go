@@ -14,6 +14,36 @@ var spaces = NewStorage(
 	nil,
 )
 
+func TestCommunityMediaUsesExistingReleaseSafetyChecks(t *testing.T) {
+	raw := "https://media.neonsystems.net/uploads/communities/realm/profile.jpg"
+	target := &Target{Type: "realm_media", ID: "realm"}
+	for _, inUse := range []bool{false, true} {
+		store := &fakeStore{record: &FileRecord{Status: "attached", AttachedTo: []Target{*target}}, inUse: inUse}
+		bucket := &fakeBucket{}
+		outcome := release(t, store, bucket, raw, target, false)
+		if inUse && (outcome.Decision != "in_use" || len(bucket.removed) != 0) {
+			t.Fatalf("shared community media was removed: %+v", outcome)
+		}
+		if !inUse && (outcome.Decision != "deleted" || len(bucket.removed) != 1) {
+			t.Fatalf("community media was not released: %+v", outcome)
+		}
+	}
+}
+
+func TestRealmMediaLivenessOnlyChangesForValidatedDeletingScopes(t *testing.T) {
+	ctx := context.Background()
+	target := Target{Type: "realm_media", ID: "realm"}
+	if live, err := (DBStore{}).IsTargetLive(ctx, target); err != nil || !live {
+		t.Fatalf("ordinary/deactivated realm media changed: %v %v", live, err)
+	}
+	if live, err := (DBStore{DeletingRealmIDs: []string{"realm"}}).IsTargetLive(ctx, target); err != nil || live {
+		t.Fatalf("deleting realm kept its own attachment live: %v %v", live, err)
+	}
+	if live, err := (DBStore{DeletingRealmIDs: []string{"other"}}).IsTargetLive(ctx, target); err != nil || !live {
+		t.Fatalf("outside realm media changed: %v %v", live, err)
+	}
+}
+
 func TestKeyFromURL(t *testing.T) {
 	const key = "uploads/entries/9/x y.jpg"
 	for _, u := range []string{
@@ -41,12 +71,13 @@ func TestKeyFromURL(t *testing.T) {
 // fakes
 
 type fakeStore struct {
-	record    *FileRecord
-	reported  bool
-	inUse     bool
-	live      map[string]bool // target id -> live
-	saved     []FileRecord
-	usedCheck *Target
+	record      *FileRecord
+	reported    bool
+	reportedIDs map[string]bool
+	inUse       bool
+	live        map[string]bool // target id -> live
+	saved       []FileRecord
+	usedCheck   *Target
 }
 
 func (f *fakeStore) FindRecord(context.Context, string, string) (*FileRecord, error) {
@@ -56,9 +87,22 @@ func (f *fakeStore) SaveRecord(_ context.Context, r *FileRecord) error {
 	f.saved = append(f.saved, *r)
 	return nil
 }
-func (f *fakeStore) IsReported(context.Context, Target) (bool, error) { return f.reported, nil }
+func (f *fakeStore) IsReported(_ context.Context, target Target) (bool, error) {
+	return f.reported || f.reportedIDs[target.ID], nil
+}
 func (f *fakeStore) IsTargetLive(_ context.Context, t Target) (bool, error) {
 	return f.live[t.ID], nil
+}
+
+func TestReportedOtherAttachmentRemainsHeldWhenWholeScopeIsDeleted(t *testing.T) {
+	target := &Target{Type: "post", ID: "unreported-post"}
+	store := &fakeStore{record: &FileRecord{Status: "attached", AttachedTo: []Target{*target, {Type: "comment", ID: "reported-comment"}}},
+		reportedIDs: map[string]bool{"reported-comment": true}}
+	bucket := &fakeBucket{}
+	outcome := release(t, store, bucket, "https://media.neonsystems.net/uploads/posts/file.jpg", target, false)
+	if outcome.Decision != "held" || len(bucket.removed) != 0 {
+		t.Fatalf("reported evidence was lost through another deleted attachment: %+v", outcome)
+	}
 }
 func (f *fakeStore) URLInUse(_ context.Context, _, _ string, except *Target, _ string) (bool, error) {
 	f.usedCheck = except

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 
 	"worker_service/internal/connections"
@@ -16,7 +17,12 @@ import (
 
 // DBStore is the Store over the real databases: the Node server's `files`
 // and `messages` collections in Mongo, everything else in Postgres.
-type DBStore struct{}
+type DBStore struct {
+	// Set only by cleanup after validating the persisted deletion intent.
+	// Empty by default: normal media release keeps its existing behavior.
+	DeletingRealmIDs  []string
+	DeletingEntityIDs []string
+}
 
 func (DBStore) pool() (*pgxpool.Pool, error) {
 	pool := connections.Pool()
@@ -110,6 +116,9 @@ func targetLivenessSQL(kind string) string {
 }
 
 func (s DBStore) IsTargetLive(ctx context.Context, t Target) (bool, error) {
+	if t.Type == "realm_media" && slices.Contains(s.DeletingRealmIDs, t.ID) {
+		return false, nil
+	}
 	if t.Type == "message" {
 		messages, err := collection("messages")
 		if err != nil {
@@ -131,7 +140,12 @@ func (s DBStore) IsTargetLive(ctx context.Context, t Target) (bool, error) {
 		return false, err
 	}
 	var live bool
-	err = pool.QueryRow(ctx, sql, t.ID).Scan(&live)
+	if t.Type == "note" && len(s.DeletingEntityIDs) > 0 {
+		err = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM notes_entry
+		 WHERE id=$1 AND entity_id<>ALL($2::text[]))`, t.ID, s.DeletingEntityIDs).Scan(&live)
+	} else {
+		err = pool.QueryRow(ctx, sql, t.ID).Scan(&live)
+	}
 	return live, err
 }
 
@@ -156,7 +170,8 @@ func (s DBStore) URLInUse(ctx context.Context, rawURL, key string, except *Targe
 	var inUse bool
 	err = pool.QueryRow(ctx, `SELECT
 	   EXISTS (SELECT 1 FROM user_account WHERE profile = $1 OR coverphoto = $1)
-	OR EXISTS (SELECT 1 FROM community_realm WHERE profile = $1 OR cover_photo = $1)
+	OR EXISTS (SELECT 1 FROM community_realm WHERE (profile = $1 OR cover_photo = $1)
+	 AND id<>ALL(COALESCE($4::text[], '{}')))
 	OR EXISTS (
 	     SELECT 1 FROM newsfeed_postreference r
 	       JOIN newsfeed_post p ON p.post_id = r.post_id
@@ -170,8 +185,9 @@ func (s DBStore) URLInUse(ctx context.Context, rawURL, key string, except *Targe
 	     SELECT 1 FROM newsfeed_comment c
 	      WHERE c.attachment = $1 AND c.deleted_at IS NULL AND c.comment_id <> $3)
     OR EXISTS (SELECT 1 FROM diary_attachment WHERE url = $1)
-    OR EXISTS (SELECT 1 FROM notes_attachment WHERE url = $1)`,
-		rawURL, exceptPost, exceptComment,
+    OR EXISTS (SELECT 1 FROM notes_attachment a JOIN notes_entry n ON n.id=a.note_id
+      WHERE a.url=$1 AND n.entity_id<>ALL(COALESCE($5::text[], '{}')))`,
+		rawURL, exceptPost, exceptComment, s.DeletingRealmIDs, s.DeletingEntityIDs,
 	).Scan(&inUse)
 	if err != nil || inUse {
 		return inUse, err

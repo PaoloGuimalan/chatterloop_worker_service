@@ -2,12 +2,14 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
 	"time"
 	"worker_service/internal/connections"
+	"worker_service/internal/services/realmlifecycle"
 
 	"github.com/jackc/pgx/v5"
 	"go.mongodb.org/mongo-driver/bson"
@@ -107,6 +109,22 @@ func PostConversationNotice(ctx context.Context, p ConversationNoticePayload) er
 	conversationType := "single"
 	conversationName := ""
 	if isRealm {
+		scopeTx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer scopeTx.Rollback(ctx) // Read locks only; Mongo remains the existing write path.
+		if err := realmlifecycle.LockActiveScopes(ctx, scopeTx, p.ConversationID, p.ActorEntityID); err != nil {
+			if errors.Is(err, realmlifecycle.ErrScopeUnavailable) {
+				return nil
+			}
+			return err
+		}
+		if allowed, err := communityChatAllowed(ctx, scopeTx, p.ConversationID, p.ActorEntityID); err != nil {
+			return err
+		} else if !allowed {
+			return nil
+		}
 		var hasChat bool
 		conversationType, hasChat = noticeConversationType(realm.Type)
 		if !hasChat {
@@ -120,6 +138,11 @@ func PostConversationNotice(ctx context.Context, p ConversationNoticePayload) er
 		members, conversationType = conversationFacts(ctx, p.ConversationID)
 	}
 
+	if len(members) == 0 {
+		// A deleted realm must not be recreated as a direct conversation by a
+		// delayed join notice. Existing direct conversations retain their members.
+		return nil
+	}
 	messageID := newMessageID()
 	now := time.Now().UTC()
 

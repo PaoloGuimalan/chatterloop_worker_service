@@ -10,6 +10,7 @@ import (
 	"worker_service/internal/connections"
 	"worker_service/internal/services/media"
 	"worker_service/internal/services/rabbitmq"
+	"worker_service/internal/services/realmlifecycle"
 )
 
 func Init() {
@@ -84,12 +85,13 @@ func handleErr[T any](fn func(ctx context.Context, payload T) error) rabbitmq.Ha
 // Postgres, Astra and Mongo on restart.
 func initialize_consumers(rmq *rabbitmq.RabbitMQ) {
 	slog.Info("Initializing RabbitMQ background consumers...")
+	rmq.Register(realmDeletionConsumer())
 
 	rmq.Register(rabbitmq.ConsumerConfig{
 		Queue:   "update_ranking_score",
 		Timeout: 10 * time.Second,
 		Handler: handle(func(ctx context.Context, p rabbitmq.UpdateRankingPayload) {
-			rabbitmq.UpdateRankingScore(p.PostID, p.UpdateType, p.IsDecrease)
+			rabbitmq.UpdateRankingScore(p.PostID, p.UpdateType, p.IsDecrease, p.SourceActivityID)
 		}),
 	})
 
@@ -241,4 +243,10 @@ func initialize_consumers(rmq *rabbitmq.RabbitMQ) {
 	if err := rmq.Start(); err != nil {
 		log.Fatalf("Failed to start RabbitMQ consumers: %v", err)
 	}
+}
+
+func realmDeletionConsumer() rabbitmq.ConsumerConfig {
+	// Bounded broker retries; the committed intent is also rediscovered by cron.
+	return rabbitmq.ConsumerConfig{Queue: "realm_deletion", Timeout: 5 * time.Minute,
+		Workers: 1, Prefetch: 1, UntilShutdown: true, Handler: handleErr[realmlifecycle.DeletionJob](rabbitmq.DeleteRealm)}
 }

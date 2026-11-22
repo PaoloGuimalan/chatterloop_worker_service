@@ -50,6 +50,10 @@ func TestApprovalScopePostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(ctx, `ALTER TABLE community_realm ADD COLUMN parent_id text;
+	 ALTER TABLE community_realm ADD COLUMN deletion_requested_at timestamptz;`); err != nil {
+		t.Fatal(err)
+	}
 	store := postgresFanoutStore{db: db}
 	decisionID := "cb48b3df-bd09-44b5-b218-b47f1afce820"
 	if _, err := db.Exec(ctx, `INSERT INTO community_approvals VALUES ($1,'realm','community-post','post','reject')`, decisionID); err != nil {
@@ -135,5 +139,21 @@ func TestApprovalScopePostgres(t *testing.T) {
 	}
 	if shares != 4 || boost != 2 || rank == 99 || rank <= 0 {
 		t.Fatalf("refresh changed engagement/boost or did not recalculate: shares=%d boost=%v rank=%v", shares, boost, rank)
+	}
+	if _, err := db.Exec(ctx, `UPDATE newsfeed_postscore SET comments_count=0 WHERE post_id='ordinary';
+	 INSERT INTO newsfeed_comment(comment_id,post_id,entity_id,deleted_at) VALUES ('removed-page-comment','ordinary','page',NOW())`); err != nil {
+		t.Fatal(err)
+	}
+	updateRankingScore(ctx, db, "ordinary", "comment", false, "removed-page-comment")
+	var comments int
+	if err := db.QueryRow(ctx, `SELECT comments_count FROM newsfeed_postscore WHERE post_id='ordinary'`).Scan(&comments); err != nil || comments != 0 {
+		t.Fatalf("removed page activity counted again: %d %v", comments, err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE newsfeed_comment SET deleted_at=NULL WHERE comment_id='removed-page-comment'`); err != nil {
+		t.Fatal(err)
+	}
+	updateRankingScore(ctx, db, "ordinary", "comment", false, "removed-page-comment")
+	if err := db.QueryRow(ctx, `SELECT comments_count FROM newsfeed_postscore WHERE post_id='ordinary'`).Scan(&comments); err != nil || comments != 1 {
+		t.Fatalf("live activity changed: %d %v", comments, err)
 	}
 }
